@@ -1,0 +1,559 @@
+//! Bridge between the immediate-mode UI and the async launcher core.
+//!
+//! egui renders on the main thread and must never block, so every long-running
+//! operation (network, hashing, launching) runs on a worker thread and reports
+//! back through a channel. The UI drains the channel each frame and calls
+//! [`egui::Context::request_repaint`] when work completes.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use crossbeam_channel::{Receiver, Sender, unbounded};
+use mango_core::Result;
+use mango_core::install::{PlanRoots, install_instance};
+use mango_core::instance::UserInstance;
+use mango_core::java::{self, JavaInstallation};
+use mango_core::manifest::{Manifest, ServerEntry};
+use mango_core::mojang::rules::RuleContext;
+use mango_core::net::downloader::Progress as DownloadProgress;
+use mango_core::net::http;
+use mango_core::server::ServerStatus;
+
+/// Commands the UI sends to the worker.
+#[derive(Debug)]
+pub enum Command {
+    /// Load a manifest and report its servers.
+    LoadManifest { source: String, cache_root: PathBuf },
+    /// Install a server's files, streaming progress.
+    Install { server: Box<ServerEntry>, roots: PlanRoots },
+    /// Install a player-created instance.
+    InstallInstance { instance: Box<UserInstance>, roots: PlanRoots },
+    /// Launch the game for a server.
+    Launch {
+        server: Box<ServerEntry>,
+        roots: PlanRoots,
+        username: String,
+        java: PathBuf,
+        detached: bool,
+    },
+    /// Launch a player-created instance.
+    LaunchInstance {
+        instance: Box<UserInstance>,
+        roots: PlanRoots,
+        username: String,
+        detached: bool,
+    },
+    /// Probe every JVM on the machine.
+    DiscoverJava,
+    /// Ping a server for its player count and MOTD.
+    PingServer { address: String },
+    /// Fetch the list of installable Minecraft versions.
+    LoadVersions,
+    /// Fetch the loader versions for a loader and game version.
+    LoadLoaderVersions { kind: mango_core::manifest::LoaderKind, minecraft: String },
+}
+
+/// Events the worker sends back to the UI.
+#[derive(Debug)]
+pub enum Event {
+    ManifestLoaded {
+        manifest: Arc<Manifest>,
+    },
+    JavaDiscovered {
+        installations: Vec<JavaInstallation>,
+    },
+    ServerStatus {
+        address: String,
+        status: Box<ServerStatus>,
+    },
+    /// Download/verify progress for an install or launch.
+    Progress(DownloadProgress),
+    /// A launch got as far as spawning the JVM.
+    Launched {
+        pid: Option<u32>,
+    },
+    /// Human-readable log line for the activity panel.
+    Log(String),
+    Failed {
+        context: String,
+        message: String,
+    },
+    Finished {
+        context: String,
+    },
+    /// Installable Minecraft versions, newest first.
+    VersionsLoaded {
+        versions: Vec<String>,
+    },
+    /// Loader versions for a loader/game-version pair, newest first.
+    LoaderVersionsLoaded {
+        kind: mango_core::manifest::LoaderKind,
+        minecraft: String,
+        versions: Vec<String>,
+    },
+}
+
+/// Handle held by the UI.
+#[derive(Clone)]
+pub struct RuntimeHandle {
+    commands: Sender<Command>,
+    events: Receiver<Event>,
+    /// Cloned into worker tasks so completed work triggers a repaint.
+    repaint: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl RuntimeHandle {
+    /// Spawn the worker thread and build the UI-side handle.
+    pub fn spawn(repaint: impl Fn() + Send + Sync + 'static) -> Self {
+        let (command_tx, command_rx) = unbounded::<Command>();
+        let (event_tx, event_rx) = unbounded::<Event>();
+        let repaint = Arc::new(repaint);
+
+        let worker_events = event_tx.clone();
+        let worker_repaint = Arc::clone(&repaint);
+
+        std::thread::Builder::new()
+            .name("mango-worker".to_owned())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .thread_name("mango-async")
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(err) => {
+                        let _ = worker_events.send(Event::Failed {
+                            context: "runtime".to_owned(),
+                            message: format!("could not start async runtime: {err}"),
+                        });
+                        (worker_repaint)();
+                        return;
+                    }
+                };
+
+                let sender = EventSender { events: worker_events, repaint: worker_repaint };
+                for command in command_rx {
+                    runtime.block_on(run_command(command, &sender));
+                }
+            })
+            .expect("could not spawn the launcher worker thread");
+
+        Self { commands: command_tx, events: event_rx, repaint }
+    }
+
+    pub fn send(&self, command: Command) {
+        let _ = self.commands.send(command);
+        (self.repaint)();
+    }
+
+    /// Non-blocking drain of everything the worker produced.
+    pub fn poll(&self) -> Vec<Event> {
+        self.events.try_iter().collect()
+    }
+}
+
+struct EventSender {
+    events: Sender<Event>,
+    repaint: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl EventSender {
+    fn send(&self, event: Event) {
+        let _ = self.events.send(event);
+        // The UI is idle waiting for input; wake it so the event is drawn.
+        (self.repaint)();
+    }
+
+    fn log(&self, message: impl Into<String>) {
+        self.send(Event::Log(message.into()));
+    }
+
+    fn failed(&self, context: impl Into<String>, err: impl std::fmt::Display) {
+        self.send(Event::Failed { context: context.into(), message: err.to_string() });
+    }
+}
+
+async fn run_command(command: Command, sender: &EventSender) {
+    match command {
+        Command::LoadManifest { source, cache_root } => {
+            let result = load_manifest(&source, &cache_root).await;
+            match result {
+                Ok(manifest) => {
+                    sender.log(format!(
+                        "manifest loaded: {} ({} servers)",
+                        manifest.name,
+                        manifest.servers.len()
+                    ));
+                    sender.send(Event::ManifestLoaded { manifest: Arc::new(manifest) });
+                }
+                Err(err) => sender.failed("manifest", err),
+            }
+        }
+        Command::Install { server, roots } => {
+            sender.log(format!("installing {}", server.name));
+            let client = match http::build_client() {
+                Ok(client) => client,
+                Err(err) => return sender.failed("install", err),
+            };
+
+            let progress = ProgressBridge { sender };
+            let outcome = install_instance(
+                &client,
+                &server.to_instance_spec(),
+                &roots,
+                &RuleContext::new(),
+                None,
+                &mango_core::install::InstallOptions::default(),
+                &|event| progress.on(event),
+            )
+            .await;
+
+            match outcome {
+                Ok(outcome) => {
+                    sender.log(format!(
+                        "installed {} files ({} downloaded, {} mods)",
+                        outcome.plan.files.len(),
+                        outcome.downloaded,
+                        outcome.mods.resolved.len()
+                    ));
+                    for failure in &outcome.mods.failures {
+                        sender.log(format!("mod {} skipped: {}", failure.id, failure.reason));
+                    }
+                    sender.send(Event::Finished { context: "install".to_owned() });
+                }
+                Err(err) => sender.failed("install", err),
+            }
+        }
+        Command::Launch { server, roots, username, java, detached } => {
+            let client = match http::build_client() {
+                Ok(client) => client,
+                Err(err) => return sender.failed("launch", err),
+            };
+
+            let java = match select_java(&client, &server, java, sender).await {
+                Ok(java) => java,
+                Err(err) => return sender.failed("launch", err),
+            };
+            sender.log(format!("launching {} with {}", server.name, java.display()));
+
+            let spec = mango_core::launch::LaunchSpec {
+                minecraft_version: server.minecraft.clone(),
+                version_name: server.id.clone(),
+                game_directory: roots.instance_dir.clone(),
+                java_executable: java,
+                account: mango_core::launch::LaunchAccount::offline(&username),
+                loader: server.loader.clone(),
+                detached,
+                resolution: Some((1280, 720)),
+                fullscreen: false,
+                jvm_options: Vec::new(),
+                java_agents: Vec::new(),
+                auto_connect: server
+                    .auto_connect
+                    .then(|| server.host_port())
+                    .map(|(host, port)| format!("{host}:{port}")),
+            };
+
+            let progress = ProgressBridge { sender };
+            let process = mango_core::launch::service::launch(
+                &client,
+                &spec,
+                &roots,
+                &RuleContext::new(),
+                &std::env::temp_dir(),
+            )
+            .await;
+            let _ = progress;
+
+            match process {
+                Ok(process) => {
+                    let pid = process.pid();
+                    sender.log(format!("game started (pid {pid:?})"));
+                    sender.send(Event::Launched { pid });
+                    if !detached {
+                        let exit = process.wait().await;
+                        match exit {
+                            Ok(code) => sender.log(format!("game exited with {code:?}")),
+                            Err(err) => sender.failed("launch", err),
+                        }
+                        sender.send(Event::Finished { context: "launch".to_owned() });
+                    }
+                }
+                Err(err) => sender.failed("launch", err),
+            }
+        }
+        Command::DiscoverJava => {
+            let installations = java::discover::discover();
+            sender.log(format!("found {} Java runtime(s)", installations.len()));
+            sender.send(Event::JavaDiscovered { installations });
+        }
+        Command::InstallInstance { instance, roots } => {
+            sender.log(format!("installing {}", instance.name));
+            let client = match http::build_client() {
+                Ok(client) => client,
+                Err(err) => return sender.failed("install", err),
+            };
+
+            let progress = ProgressBridge { sender };
+            let outcome = install_instance(
+                &client,
+                &instance.to_spec(),
+                &roots,
+                &RuleContext::new(),
+                None,
+                &mango_core::install::InstallOptions::default(),
+                &|event| progress.on(event),
+            )
+            .await;
+
+            match outcome {
+                Ok(outcome) => {
+                    sender.log(format!(
+                        "installed {} files ({} downloaded, {} mods)",
+                        outcome.plan.files.len(),
+                        outcome.downloaded,
+                        outcome.mods.resolved.len()
+                    ));
+                    for failure in &outcome.mods.failures {
+                        sender.log(format!("mod {} skipped: {}", failure.id, failure.reason));
+                    }
+                    sender.send(Event::Finished { context: "install".to_owned() });
+                }
+                Err(err) => sender.failed("install", err),
+            }
+        }
+        Command::LaunchInstance { instance, roots, username, detached } => {
+            let client = match http::build_client() {
+                Ok(client) => client,
+                Err(err) => return sender.failed("launch", err),
+            };
+
+            let java = read_java(&client, &instance, sender).await;
+            let java = match java {
+                Ok(java) => java,
+                Err(err) => return sender.failed("launch", err),
+            };
+            sender.log(format!("launching {} with {}", instance.name, java.display()));
+
+            crate::runtime::launch_user_instance(
+                &client, &instance, &roots, &username, java, detached, sender,
+            )
+            .await;
+        }
+        Command::LoadVersions => match load_versions().await {
+            Ok(versions) => {
+                sender.log(format!("{} Minecraft versions available", versions.len()));
+                sender.send(Event::VersionsLoaded { versions });
+            }
+            Err(err) => sender.failed("versions", err),
+        },
+        Command::LoadLoaderVersions { kind, minecraft } => {
+            let client = match http::build_client() {
+                Ok(client) => client,
+                Err(err) => return sender.failed("loader versions", err),
+            };
+
+            match mango_core::loaders::available_versions(&client, kind, &minecraft).await {
+                Ok(versions) => {
+                    sender.send(Event::LoaderVersionsLoaded { kind, minecraft, versions })
+                }
+                Err(err) => {
+                    // A loader with no builds for a release is a normal answer,
+                    // not a failure worth interrupting the player for.
+                    sender.log(format!("no {} builds for {minecraft}: {err}", kind.as_str()));
+                    sender.send(Event::LoaderVersionsLoaded {
+                        kind,
+                        minecraft,
+                        versions: Vec::new(),
+                    });
+                }
+            }
+        }
+        Command::PingServer { address } => {
+            match mango_core::server::ping(&address, std::time::Duration::from_secs(5)).await {
+                Ok(status) => {
+                    sender.send(Event::ServerStatus { address, status: Box::new(status) })
+                }
+                Err(err) => sender.log(format!("status for {address}: {err}")),
+            }
+        }
+    }
+}
+
+struct ProgressBridge<'a> {
+    sender: &'a EventSender,
+}
+
+impl ProgressBridge<'_> {
+    fn on(&self, event: DownloadProgress) {
+        self.sender.send(Event::Progress(event));
+    }
+}
+
+async fn load_manifest(source: &str, cache_root: &std::path::Path) -> Result<Manifest> {
+    if source.starts_with("http://") || source.starts_with("https://") {
+        let client = http::build_client()?;
+        let cache = mango_core::manifest::cache_path_for(cache_root, source);
+        let fetched = mango_core::manifest::fetch(&client, source, &cache, true).await?;
+        Ok(fetched.manifest)
+    } else {
+        Ok(mango_core::manifest::load_local(std::path::Path::new(source))?.manifest)
+    }
+}
+
+/// Pick (or download) the JVM a user instance needs.
+async fn read_java(
+    client: &mango_core::net::http::Client,
+    instance: &UserInstance,
+    sender: &EventSender,
+) -> Result<PathBuf> {
+    // Build a spec first: the requirement comes from the version metadata, which
+    // is the only reliable source (`26.3` needs Java 25, 1.20.1 needs 17).
+    let spec = mango_core::launch::LaunchSpec {
+        minecraft_version: instance.minecraft.clone(),
+        version_name: instance.id.clone(),
+        game_directory: PathBuf::new(),
+        java_executable: PathBuf::new(),
+        account: mango_core::launch::LaunchAccount::offline("Player"),
+        loader: instance.loader.clone(),
+        detached: true,
+        resolution: None,
+        fullscreen: false,
+        jvm_options: Vec::new(),
+        java_agents: Vec::new(),
+        auto_connect: None,
+    };
+
+    let requirement =
+        mango_core::launch::service::java_requirement(client, &spec, instance.java.as_ref())
+            .await?;
+    let installations = java::discover::discover();
+
+    sender.log(format!(
+        "{} needs Java {} (found: {})",
+        instance.minecraft,
+        requirement.suggested,
+        if installations.is_empty() {
+            "none".to_owned()
+        } else {
+            installations.iter().map(|java| java.version.clone()).collect::<Vec<_>>().join(", ")
+        }
+    ));
+
+    let java_dir = std::env::temp_dir().join("mango-cache").join("java");
+    mango_core::launch::service::ensure_java(client, &requirement, &installations, None, &java_dir)
+        .await
+}
+
+/// Spawn a user instance's game process.
+#[allow(clippy::too_many_arguments)]
+async fn launch_user_instance(
+    client: &mango_core::net::http::Client,
+    instance: &UserInstance,
+    roots: &PlanRoots,
+    username: &str,
+    java: PathBuf,
+    detached: bool,
+    sender: &EventSender,
+) {
+    let spec = mango_core::launch::LaunchSpec {
+        minecraft_version: instance.minecraft.clone(),
+        version_name: instance.id.clone(),
+        game_directory: roots.instance_dir.clone(),
+        java_executable: java,
+        account: mango_core::launch::LaunchAccount::offline(username),
+        loader: instance.loader.clone(),
+        detached,
+        resolution: Some((1280, 720)),
+        fullscreen: false,
+        jvm_options: instance.jvm_args.clone(),
+        java_agents: Vec::new(),
+        auto_connect: None,
+    };
+
+    if let Err(err) = mango_core::launch::service::validate_spec(&spec) {
+        return sender.failed("launch", err);
+    }
+
+    match mango_core::launch::service::launch(
+        client,
+        &spec,
+        roots,
+        &RuleContext::new(),
+        &std::env::temp_dir(),
+    )
+    .await
+    {
+        Ok(process) => {
+            let pid = process.pid();
+            sender.log(format!("game started (pid {pid:?})"));
+            sender.send(Event::Launched { pid });
+            if !detached {
+                match process.wait().await {
+                    Ok(code) => sender.log(format!("game exited with {code:?}")),
+                    Err(err) => sender.failed("launch", err),
+                }
+                sender.send(Event::Finished { context: "launch".to_owned() });
+            }
+        }
+        Err(err) => sender.failed("launch", err),
+    }
+}
+
+/// Fetch release version ids, newest first.
+async fn load_versions() -> Result<Vec<String>> {
+    let client = http::build_client()?;
+    let manifest: mango_core::mojang::VersionManifest =
+        http::get_json(&client, mango_core::install::service::VERSION_MANIFEST_URL).await?;
+    Ok(manifest
+        .versions
+        .iter()
+        .filter(|version| version.kind == "release")
+        .map(|version| version.id.clone())
+        .collect())
+}
+
+/// Build plan roots for a server.
+pub fn roots_for(game_root: &std::path::Path, server_id: &str) -> PlanRoots {
+    PlanRoots::new(game_root.join("common"), game_root.join("instances").join(server_id))
+}
+
+/// Pick (or download) the JVM this instance needs.
+///
+/// Delegates to the same selector the CLI uses, so both front ends agree on which
+/// Java a given Minecraft version requires.
+async fn select_java(
+    client: &mango_core::net::http::Client,
+    server: &ServerEntry,
+    preferred: PathBuf,
+    sender: &EventSender,
+) -> Result<PathBuf> {
+    use mango_core::java::{JavaChoice, choose_java, requirement_for};
+
+    let requirement = requirement_for(&server.minecraft, server.java.as_ref());
+    let installations = java::discover::discover();
+
+    sender.log(format!(
+        "{} needs Java {} (found: {})",
+        server.minecraft,
+        requirement.suggested,
+        if installations.is_empty() {
+            "none".to_owned()
+        } else {
+            installations.iter().map(|java| java.version.clone()).collect::<Vec<_>>().join(", ")
+        }
+    ));
+
+    // The runtime picked in Settings acts as a pin.
+    let pinned = preferred.to_str();
+
+    match choose_java(&installations, &requirement, pinned) {
+        JavaChoice::Installed(java) => Ok(java.executable),
+        JavaChoice::NeedsDownload { major, reason } => {
+            sender.log(format!("{reason}; downloading Java {major}"));
+            let java_dir = std::env::temp_dir().join("mango-cache").join("java");
+            let download = java::resolve_jdk(client, major).await?;
+            java::install_jdk(client, &java_dir, &download, major).await
+        }
+    }
+}

@@ -1,0 +1,89 @@
+{
+  "schemaVersion": 1,
+  "name": "Mango Network",
+  "updatedAt": "2026-11-09T00:00:00Z",
+  "news": {
+    "rss": "https://example.com/news.rss"
+  },
+  "discord": {
+    "clientId": "123456789012345678",
+    "largeImageKey": "mango-large",
+    "largeImageText": "Mango Network",
+    "smallImageKey": "mango-small",
+    "smallImageText": "mangolauncher"
+  },
+  "servers": [
+    {
+      "id": "main",
+      "name": "Mango Survival",
+      "description": "The main survival server.",
+      "icon": "https://example.com/icons/main.png",
+      "address": "play.example.com:25565",
+      "minecraft": "1.20.1",
+      "mainServer": true,
+      "autoConnect": true,
+      "loader": {
+        "type": "fabric",
+        "version": "0.16.9"
+      },
+      "java": {
+        "supported": ">=17",
+        "suggested": 17,
+        "distribution": "temurin",
+        "ram": {
+          "recommended": 4096,
+          "minimum": 2048
+        }
+      },
+      "jvmArgs": ["-XX:+UseG1GC"],
+      "mods": [
+        {
+          "source": "modrinth",
+          "id": "sodium",
+          "version": "latest",
+          "required": true
+        },
+        {
+          "source": "modrinth",
+          "id": "iris",
+          "version": "latest",
+          "required": false
+        },
+        {
+          "source": "curseforge",
+          "id": 238222,
+          "fileId": 4567890,
+          "required": false,
+          "disabledByDefault": true
+        }
+      ],
+      "files": [
+        {
+          "path": "config/mango.cfg",
+          "url": "https://cdn.example.com/main/config/mango.cfg",
+          "size": 1234,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "overwrite": false
+        }
+      ]
+    },
+    {
+      "id": "creative",
+      "name": "Mango Creative",
+      "description": "Vanilla creative plots.",
+      "address": "creative.example.com",
+      "minecraft": "1.21.4",
+      "mainServer": false,
+      "autoConnect": false,
+      "loader": {
+        "type": "vanilla"
+      },
+      "java": {
+        "supported": ">=21",
+        "suggested": 21
+      },
+      "mods": [],
+      "files": []
+    }
+  ]
+}

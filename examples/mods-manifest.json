@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "name": "Mod Resolution Test",
+  "updatedAt": "2026-11-09T00:00:00Z",
+  "servers": [
+    {
+      "id": "mods",
+      "name": "Mods",
+      "address": "localhost",
+      "minecraft": "1.20.1",
+      "mainServer": true,
+      "loader": { "type": "fabric", "version": "0.16.9" },
+      "mods": [
+        { "source": "modrinth", "id": "sodium", "version": "latest", "required": true },
+        { "source": "modrinth", "id": "iris", "version": "latest", "required": false },
+        { "source": "modrinth", "id": "this-mod-does-not-exist-zzz", "required": false },
+        { "source": "curseforge", "id": 238222, "required": false }
+      ]
+    }
+  ]
+}

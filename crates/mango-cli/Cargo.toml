@@ -1,0 +1,19 @@
+[package]
+name = "mango-cli"
+description = "Command line interface for the Mango Minecraft launcher"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "mango"
+path = "src/main.rs"
+
+[dependencies]
+mango-core = { path = "../mango-core" }
+clap.workspace = true
+tracing.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
