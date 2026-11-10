@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{MangoError, Result};
-use crate::manifest::{FileEntry, JavaSpec, LoaderKind, LoaderSpec, ModEntry, ServerEntry};
+use crate::manifest::{FileEntry, LoaderKind, LoaderSpec, ModEntry, ServerEntry};
 
 /// Everything needed to install and launch one instance.
 #[derive(Debug, Clone, PartialEq)]
@@ -25,7 +25,6 @@ pub struct InstanceSpec {
     pub name: String,
     pub minecraft: String,
     pub loader: LoaderSpec,
-    pub java: Option<JavaSpec>,
     pub jvm_args: Vec<String>,
     pub mods: Vec<ModEntry>,
     pub files: Vec<FileEntry>,
@@ -64,7 +63,6 @@ impl ServerEntry {
             name: self.name.clone(),
             minecraft: self.minecraft.clone(),
             loader: self.loader.clone(),
-            java: self.java.clone(),
             jvm_args: self.jvm_args.clone(),
             mods: self.mods.clone(),
             files: self.files.clone(),
@@ -77,7 +75,7 @@ impl ServerEntry {
 
 /// A player-created instance as stored on disk.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct UserInstance {
     pub id: String,
     pub name: String,
@@ -85,14 +83,18 @@ pub struct UserInstance {
     #[serde(default)]
     pub loader: LoaderSpec,
     #[serde(default)]
-    pub java: Option<JavaSpec>,
-    #[serde(default)]
     pub jvm_args: Vec<String>,
     #[serde(default)]
     pub mods: Vec<ModEntry>,
     /// ISO-8601 timestamp, for sorting the list.
     #[serde(default)]
     pub created_at: Option<String>,
+    /// Rejected Java requirement from an older launcher, ignored on load.
+    ///
+    /// Kept so `instance.json` files written before the requirement moved to the
+    /// release metadata still load; they lose the field on the next save.
+    #[serde(default, rename = "java", skip_serializing)]
+    pub legacy_java: Option<serde_json::Value>,
 }
 
 /// File name of a user instance definition inside its directory.
@@ -107,7 +109,6 @@ pub struct InstanceEdit {
     pub name: String,
     pub minecraft: String,
     pub loader: LoaderSpec,
-    pub java: Option<JavaSpec>,
     pub jvm_args: Vec<String>,
 }
 
@@ -118,7 +119,6 @@ impl From<&UserInstance> for InstanceEdit {
             name: instance.name.clone(),
             minecraft: instance.minecraft.clone(),
             loader: instance.loader.clone(),
-            java: instance.java.clone(),
             jvm_args: instance.jvm_args.clone(),
         }
     }
@@ -150,10 +150,10 @@ impl UserInstance {
             name: if name.trim().is_empty() { id.to_owned() } else { name.trim().to_owned() },
             minecraft: minecraft.trim().to_owned(),
             loader,
-            java: None,
             jvm_args: Vec::new(),
             mods: Vec::new(),
             created_at: Some(now_iso8601()),
+            legacy_java: None,
         })
     }
 
@@ -164,7 +164,6 @@ impl UserInstance {
             name: self.name.clone(),
             minecraft: self.minecraft.clone(),
             loader: self.loader.clone(),
-            java: self.java.clone(),
             jvm_args: self.jvm_args.clone(),
             mods: self.mods.clone(),
             files: Vec::new(),
@@ -195,7 +194,6 @@ impl UserInstance {
         self.name = if name.is_empty() { self.id.clone() } else { name.to_owned() };
         self.minecraft = minecraft.to_owned();
         self.loader = edit.loader;
-        self.java = edit.java;
         self.jvm_args = edit.jvm_args;
         Ok(())
     }
@@ -438,6 +436,37 @@ mod tests {
     }
 
     #[test]
+    fn an_instance_file_from_an_older_launcher_still_loads() {
+        // Older launchers wrote a `java` block that pinned the runtime. The field
+        // is gone from the model but must not make the file unreadable, or every
+        // existing instance would disappear from the list.
+        let root = std::env::temp_dir().join(format!("mango-legacy-{}", std::process::id()));
+        let dir = root.join("old");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(INSTANCE_FILE);
+
+        std::fs::write(
+            &path,
+            r#"{"id":"old","name":"Old","minecraft":"1.20.1",
+                "loader":{"type":"vanilla","version":null},
+                "java":{"supported":">=17","suggested":17},"jvmArgs":[],"mods":[]}"#,
+        )
+        .unwrap();
+
+        let loaded = UserInstance::load(&dir).expect("a legacy file must load");
+        let instance = loaded.expect("the instance must be present");
+        assert_eq!(instance.id, "old");
+        assert_eq!(instance.minecraft, "1.20.1");
+
+        // Saving drops the rejected field, so the file converges on the new shape.
+        instance.save(&root).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("\"java\""), "the override must not be written back: {text}");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn updating_changes_only_the_editable_fields() {
         let loader = LoaderSpec { kind: LoaderKind::Fabric, version: Some("0.16.9".to_owned()) };
         let mut instance = UserInstance::new("keep-id", "Old", "1.20.1", loader).unwrap();
@@ -451,7 +480,6 @@ mod tests {
                     kind: LoaderKind::Neoforge,
                     version: Some("21.1.92".to_owned()),
                 },
-                java: None,
                 jvm_args: vec!["-Xmx4G".to_owned()],
             })
             .unwrap();

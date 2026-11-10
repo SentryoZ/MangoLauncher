@@ -360,7 +360,6 @@ impl InstanceForm {
                 name: self.name.clone(),
                 minecraft: self.minecraft.clone(),
                 loader: self.loader_spec(),
-                java: instance.java.clone(),
                 jvm_args: instance.jvm_args.clone(),
             })
             .map_err(|err| err.to_string())

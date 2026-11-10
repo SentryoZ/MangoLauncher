@@ -11,7 +11,6 @@ use tracing::{info, warn};
 use crate::config::JavaConfig;
 use crate::java::discover::{self, JavaInstallation};
 use crate::java::version::satisfies;
-use crate::manifest::JavaSpec;
 
 /// Java requirement for an instance.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,37 +36,6 @@ pub enum JavaChoice {
     NeedsDownload { major: u32, reason: String },
 }
 
-/// Java major version to use when a release's metadata is unavailable.
-///
-/// Mojang publishes the authoritative value in `version.json` as
-/// `javaVersion.majorVersion`, and that is what the launcher uses. This mapping
-/// only covers the legacy `1.x` scheme, where the game version identifies the
-/// runtime reliably (1.16.5 and older need 8, 1.17–1.20.4 need 17, 1.20.5+
-/// need 21).
-///
-/// Newer releases use a different scheme (`26.3`, `27.1`, …) that carries no
-/// hint about the runtime, so guessing from it is impossible; 21 is returned as
-/// a last resort and callers must prefer the metadata.
-pub fn default_major(minecraft: &str) -> u32 {
-    let (major, minor, patch) = parse_semver(minecraft);
-    if major != 1 {
-        // Unknown scheme: no information is encoded in the version number.
-        return 21;
-    }
-
-    match minor {
-        0..=16 => 8,
-        17..=20 => {
-            if minor == 20 && patch >= 5 {
-                21
-            } else {
-                17
-            }
-        }
-        _ => 21,
-    }
-}
-
 /// Build a requirement from the authoritative major in `version.json`.
 ///
 /// The range is bounded to that single major: Minecraft crashes at class
@@ -77,56 +45,24 @@ pub fn requirement_from_metadata(major: u32) -> JavaRequirement {
     JavaRequirement { supported: bounded_range(major), suggested: major, exact_major: major }
 }
 
-/// Derive the requirement from a manifest entry, falling back to the game version.
+/// Requirement for a Minecraft version.
 ///
-/// Prefer [`requirement_from_metadata`] whenever `version.json` has been
-/// fetched: it is authoritative. This function is the offline/early path used
-/// before the version metadata is available, for example to show a requirement in
-/// the UI.
-pub fn requirement_for(minecraft: &str, spec: Option<&JavaSpec>) -> JavaRequirement {
-    let default = default_major(minecraft);
-
-    match spec {
-        Some(spec) => {
-            let suggested = spec.suggested.unwrap_or(default);
-            JavaRequirement {
-                // An explicit range from the manifest is trusted as written: the
-                // server owner knows which runtimes their pack tolerates.
-                supported: spec.supported.clone().unwrap_or_else(|| bounded_range(suggested)),
-                suggested,
-                exact_major: suggested,
-            }
-        }
-        None => requirement_from_metadata(default),
-    }
+/// `javaVersion.majorVersion` from `version.json` is the only source, because it
+/// is authoritative for every release scheme: `26.3` needs 25, `1.20.1` needs 17,
+/// `1.12.2` needs 8. The version id itself cannot be used — the post-`1.x` names
+/// carry no runtime hint — and a manifest cannot improve on Mojang's own answer.
+///
+/// `metadata_major` is `None` only when the metadata has not been fetched yet.
+pub fn requirement_for_version(metadata_major: Option<u32>) -> JavaRequirement {
+    requirement_from_metadata(metadata_major.unwrap_or(FALLBACK_MAJOR))
 }
 
-/// Requirement for a fetched `version.json`, preferring Mojang's own answer.
+/// Major used when the metadata truly cannot be read.
 ///
-/// `javaVersion.majorVersion` is authoritative and works for every release
-/// scheme. The manifest's range still wins when it declares one, because a server
-/// owner may know their pack tolerates a different runtime.
-pub fn requirement_for_version(
-    minecraft: &str,
-    metadata_major: Option<u32>,
-    spec: Option<&JavaSpec>,
-) -> JavaRequirement {
-    let Some(major) = metadata_major else {
-        return requirement_for(minecraft, spec);
-    };
-
-    match spec {
-        Some(spec) => {
-            let suggested = spec.suggested.unwrap_or(major);
-            JavaRequirement {
-                supported: spec.supported.clone().unwrap_or_else(|| bounded_range(major)),
-                suggested,
-                exact_major: major,
-            }
-        }
-        None => requirement_from_metadata(major),
-    }
-}
+/// Choosing here would be a guess, so it is deliberately not a mapping from the
+/// version name: 21 runs every release from 1.20.5 onward, and `ensure_java`
+/// downloads the exact major before anything is launched anyway.
+const FALLBACK_MAJOR: u32 = 21;
 
 /// `major` -> `>=major <major+1`
 fn bounded_range(major: u32) -> String {
@@ -209,14 +145,6 @@ pub fn memory_arguments(config: &JavaConfig) -> Vec<String> {
     vec![format!("-Xmx{}", config.max_ram), format!("-Xms{}", config.min_ram)]
 }
 
-fn parse_semver(version: &str) -> (u32, u32, u32) {
-    let mut pieces = version.split('.');
-    let major = pieces.next().and_then(|p| p.parse().ok()).unwrap_or(1);
-    let minor = pieces.next().and_then(|p| p.parse().ok()).unwrap_or(0);
-    let patch = pieces.next().and_then(|p| p.parse().ok()).unwrap_or(0);
-    (major, minor, patch)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,81 +160,40 @@ mod tests {
     }
 
     #[test]
-    fn java_major_matches_mojang_mapping() {
-        assert_eq!(default_major("1.7.10"), 8);
-        assert_eq!(default_major("1.12.2"), 8);
-        assert_eq!(default_major("1.16.5"), 8);
-        assert_eq!(default_major("1.17"), 17);
-        assert_eq!(default_major("1.19.4"), 17);
-        assert_eq!(default_major("1.20.1"), 17);
-        assert_eq!(default_major("1.20.4"), 17);
-        assert_eq!(default_major("1.20.5"), 21);
-        assert_eq!(default_major("1.21.1"), 21);
+    fn the_requirement_comes_straight_from_mojang_metadata() {
+        // The values Mojang actually publishes in `javaVersion.majorVersion`.
+        assert_eq!(requirement_for_version(Some(8)).exact_major, 8);
+        assert_eq!(requirement_for_version(Some(17)).exact_major, 17);
+        assert_eq!(requirement_for_version(Some(21)).exact_major, 21);
+        assert_eq!(requirement_for_version(Some(25)).exact_major, 25);
     }
 
     #[test]
-    fn new_version_scheme_carries_no_java_information() {
-        // Mojang moved to `26.3`-style names; the number says nothing about the
-        // runtime, so callers must use `javaVersion.majorVersion`.
-        assert_eq!(default_major("26.3"), 21);
-        assert_eq!(default_major("26.4-snapshot-7"), 21);
+    fn the_range_is_bounded_to_one_major() {
+        // "at least 17" would let Java 25 through, which crashes 1.20.1.
+        assert_eq!(requirement_for_version(Some(17)).supported, ">=17 <18");
+        assert_eq!(requirement_for_version(Some(25)).supported, ">=25 <26");
+        assert_eq!(requirement_for_version(Some(8)).supported, ">=8 <9");
     }
 
     #[test]
-    fn metadata_major_wins_over_the_version_name() {
-        // The real values Mojang publishes: 26.3 -> 25, 1.21.4 -> 21, 1.20.1 -> 17.
-        assert_eq!(requirement_from_metadata(25).exact_major, 25);
-        assert_eq!(requirement_from_metadata(25).supported, ">=25 <26");
-        assert_eq!(requirement_from_metadata(21).suggested, 21);
-
-        let requirement = requirement_for_version("26.3", Some(25), None);
+    fn a_26_3_release_gets_java_25_not_the_fallback() {
+        // The regression this module exists to prevent: the launch used to guess
+        // 21 from the version id and the game died with
+        // `Unsupported class file major version 69`.
+        let requirement = requirement_for_version(Some(25));
         assert_eq!(requirement.exact_major, 25);
         assert_eq!(requirement.supported, ">=25 <26");
     }
 
     #[test]
-    fn metadata_major_falls_back_to_the_name_without_metadata() {
-        let requirement = requirement_for_version("1.20.1", None, None);
-        assert_eq!(requirement.exact_major, 17);
-    }
-
-    #[test]
-    fn an_explicit_manifest_range_still_wins_over_metadata() {
-        let spec = JavaSpec {
-            supported: Some(">=21".to_owned()),
-            suggested: Some(21),
-            distribution: None,
-            ram: None,
-        };
-        let requirement = requirement_for_version("26.3", Some(25), Some(&spec));
-        // The range is honoured, but the exact major stays what Mojang compiled for.
-        assert_eq!(requirement.supported, ">=21");
-        assert_eq!(requirement.exact_major, 25);
-    }
-
-    #[test]
-    fn requirement_defaults_from_the_game_version() {
-        let requirement = requirement_for("1.12.2", None);
-        assert_eq!(requirement.suggested, 8);
-        // Bounded to one major, so Java 17 cannot be chosen for a 1.12.2 pack.
-        assert_eq!(requirement.supported, ">=8 <9");
-
-        let requirement = requirement_for("1.20.1", None);
-        assert_eq!(requirement.suggested, 17);
-        assert_eq!(requirement.supported, ">=17 <18");
-    }
-
-    #[test]
-    fn manifest_range_is_trusted_as_written() {
-        let spec = JavaSpec {
-            supported: Some(">=16 <20".to_owned()),
-            suggested: Some(17),
-            distribution: None,
-            ram: None,
-        };
-        let requirement = requirement_for("1.20.1", Some(&spec));
-        assert_eq!(requirement.supported, ">=16 <20");
-        assert_eq!(requirement.exact_major, 17);
+    fn missing_metadata_falls_back_without_guessing_from_the_version_name() {
+        // The old `default_major` mapped `1.12.2` to 8 from the id. That mapping is
+        // gone: the fallback is a constant, because guessing from the name is what
+        // produced the wrong runtime in the first place.
+        let requirement = requirement_for_version(None);
+        assert_eq!(requirement.exact_major, FALLBACK_MAJOR);
+        assert_eq!(requirement.suggested, FALLBACK_MAJOR);
     }
 
     #[test]
@@ -315,10 +202,8 @@ mod tests {
         // initialiser, so a numerically-satisfying but too-new runtime must not be
         // selected.
         let installations = vec![java("25.0.3", "java25")];
-        let requirement = requirement_for("1.20.1", None);
+        let requirement = requirement_for_version(Some(17));
 
-        // ">=17" is numerically satisfied by 25, so the guard has to come from the
-        // exact-major preference rather than the range.
         match choose(&installations, &requirement, None) {
             JavaChoice::NeedsDownload { major, .. } => assert_eq!(major, 17),
             other => panic!("expected a download request for java 17, got {other:?}"),
@@ -328,7 +213,7 @@ mod tests {
     #[test]
     fn exact_major_beats_a_newer_valid_range_match() {
         let installations = vec![java("17.0.9", "java17"), java("21.0.1", "java21")];
-        let requirement = requirement_for("1.20.1", None);
+        let requirement = requirement_for_version(Some(17));
 
         match choose(&installations, &requirement, None) {
             JavaChoice::Installed(java) => {
@@ -340,8 +225,6 @@ mod tests {
 
     #[test]
     fn range_fallback_allows_newer_java_when_the_exact_major_is_missing() {
-        // A server that declares a wide range may accept Java 21 for a 17-era
-        // game; the fallback honours that instead of forcing a download.
         let installations = vec![java("21.0.1", "java21")];
         let requirement =
             JavaRequirement { supported: ">=17".to_owned(), suggested: 17, exact_major: 17 };
@@ -356,7 +239,7 @@ mod tests {
     fn chooses_the_exact_major_when_available() {
         let installations =
             vec![java("1.8.0_402", "java8"), java("17.0.9", "java17"), java("21.0.1", "java21")];
-        let requirement = requirement_for("1.20.1", None);
+        let requirement = requirement_for_version(Some(17));
 
         match choose(&installations, &requirement, None) {
             JavaChoice::Installed(java) => assert_eq!(java.executable, PathBuf::from("java17")),
@@ -367,8 +250,7 @@ mod tests {
     #[test]
     fn requests_download_when_nothing_fits() {
         let installations = vec![java("25.0.3", "java25")];
-        let requirement =
-            JavaRequirement { supported: ">=17 <18".to_owned(), suggested: 17, exact_major: 17 };
+        let requirement = requirement_for_version(Some(17));
 
         match choose(&installations, &requirement, None) {
             JavaChoice::NeedsDownload { major, reason } => {
@@ -382,7 +264,7 @@ mod tests {
     #[test]
     fn pinned_java_is_used_when_it_fits() {
         let installations = vec![java("17.0.9", "java17"), java("21.0.1", "java21")];
-        let requirement = requirement_for("1.20.1", None);
+        let requirement = requirement_for_version(Some(17));
 
         match choose(&installations, &requirement, Some("java17")) {
             JavaChoice::Installed(java) => assert_eq!(java.executable, PathBuf::from("java17")),
@@ -393,7 +275,7 @@ mod tests {
     #[test]
     fn unsatisfying_pin_falls_back_to_a_matching_runtime() {
         let installations = vec![java("1.8.0_402", "java8"), java("17.0.9", "java17")];
-        let requirement = requirement_for("1.20.1", None);
+        let requirement = requirement_for_version(Some(17));
 
         match choose(&installations, &requirement, Some("java8")) {
             JavaChoice::Installed(java) => assert_eq!(java.executable, PathBuf::from("java17")),

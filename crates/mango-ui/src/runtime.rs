@@ -572,7 +572,7 @@ async fn run_command(command: Command, sender: &EventSender, presence: &mut Pres
                 auto_connect: None,
             };
 
-            match mango_core::launch::service::java_requirement(&client, &spec, None).await {
+            match mango_core::launch::service::java_requirement(&client, &spec).await {
                 Ok(requirement) => sender.send(Event::JavaRequirementResolved {
                     minecraft,
                     major: requirement.suggested,
@@ -631,9 +631,7 @@ async fn read_java(
         auto_connect: None,
     };
 
-    let requirement =
-        mango_core::launch::service::java_requirement(client, &spec, instance.java.as_ref())
-            .await?;
+    let requirement = mango_core::launch::service::java_requirement(client, &spec).await?;
     let installations = java::discover::discover();
 
     sender.log(format!(
@@ -779,8 +777,7 @@ async fn select_java(
         auto_connect: None,
     };
 
-    let requirement =
-        mango_core::launch::service::java_requirement(client, &probe, server.java.as_ref()).await?;
+    let requirement = mango_core::launch::service::java_requirement(client, &probe).await?;
     let installations = java::discover::discover();
 
     sender.log(format!(

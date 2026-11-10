@@ -165,18 +165,15 @@ impl LoaderKind {
     }
 }
 
-/// Java requirements for a server.
+/// Per-server launch preferences that the player may override.
+///
+/// Deliberately carries no Java version: Mojang publishes `javaVersion` in every
+/// release's `version.json`, including the oldest ones, so a manifest cannot add
+/// anything but a wrong answer. A `java` block from an older manifest is accepted
+/// and ignored, so existing manifests keep loading.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct JavaSpec {
-    /// npm-style semver range, e.g. `>=17`.
-    #[serde(default)]
-    pub supported: Option<String>,
-    #[serde(default)]
-    pub suggested: Option<u32>,
-    /// JDK vendor to download when no local runtime fits.
-    #[serde(default)]
-    pub distribution: Option<String>,
     #[serde(default)]
     pub ram: Option<RamSpec>,
 }
@@ -359,6 +356,23 @@ mod tests {
         assert_eq!(manifest.schema_version, 1);
         assert_eq!(manifest.name, "Mango Network");
         assert!(manifest.servers.len() >= 2);
+    }
+
+    #[test]
+    fn a_manifest_that_still_pins_java_loads_and_the_override_is_ignored() {
+        // Manifests written before the requirement moved to Mojang's metadata carry
+        // a `java.supported`/`java.suggested` pair. Dropping the fields must not
+        // make those manifests unreadable.
+        let manifest = Manifest::parse(
+            r#"{"schemaVersion":1,"name":"Legacy","servers":[
+                {"id":"a","name":"A","address":"a.example.com","minecraft":"1.20.1",
+                 "java":{"supported":">=16 <20","suggested":17,"distribution":"temurin",
+                         "ram":{"recommended":4096,"minimum":2048}}}]}"#,
+        )
+        .unwrap();
+
+        let java = manifest.servers[0].java.as_ref().expect("the block still parses");
+        assert_eq!(java.ram.map(|ram| ram.recommended), Some(4096));
     }
 
     #[test]

@@ -165,7 +165,6 @@ pub async fn build(
         name: spec.version_name.clone(),
         minecraft: spec.minecraft_version.clone(),
         loader: spec.loader.clone(),
-        java: None,
         jvm_args: Vec::new(),
         mods: Vec::new(),
         files: Vec::new(),
@@ -318,15 +317,14 @@ fn mc_at_least(version: &str, major: u32, minor: u32) -> bool {
     (current_major, current_minor) >= (major, minor)
 }
 
-/// Java requirement for a launch, using Mojang's published major when known.
+/// Java requirement for a launch, from Mojang's published major.
 ///
-/// The `version.json` for the instance is the only reliable source: release
-/// names no longer encode the runtime (`26.3` needs Java 25), and picking a newer
-/// JVM than the game was compiled for fails with `UnsupportedClassVersionError`.
+/// The `version.json` for the instance is the only source: release names no longer
+/// encode the runtime (`26.3` needs Java 25) and a manifest cannot know better, so
+/// there is nothing for a caller to override.
 pub async fn java_requirement(
     client: &Client,
     spec: &LaunchSpec,
-    java_spec: Option<&crate::manifest::JavaSpec>,
 ) -> Result<crate::java::JavaRequirement> {
     let metadata_major = match service::resolve(client, &spec.minecraft_version).await {
         Ok(resolved) => resolved.version.java_version.as_ref().map(|jv| jv.major_version),
@@ -338,7 +336,7 @@ pub async fn java_requirement(
         }
     };
 
-    Ok(crate::java::requirement_for_version(&spec.minecraft_version, metadata_major, java_spec))
+    Ok(crate::java::requirement_for_version(metadata_major))
 }
 
 /// Choose an installed JVM for a requirement, or download the matching one.

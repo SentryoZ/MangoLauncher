@@ -35,9 +35,6 @@ hosted by the launcher, and loader metadata comes from each loader's own API.
       "autoConnect": true,
       "loader": { "type": "fabric", "version": "0.16.9" },
       "java": {
-        "supported": ">=17",
-        "suggested": 17,
-        "distribution": "temurin",
         "ram": { "recommended": 4096, "minimum": 2048 }
       },
       "jvmArgs": ["-XX:+UseG1GC"],
@@ -91,10 +88,13 @@ Unknown fields are rejected so typos fail loudly instead of being ignored.
 
 | Field | Meaning |
 |---|---|
-| `supported` | npm-style semver range (`>=17`, `>=16 <20`, `^17`). Used to validate the runtime. |
-| `suggested` | Major version to download when no local JDK fits. |
-| `distribution` | Preferred JDK vendor (`temurin`). |
 | `ram.recommended` / `ram.minimum` | Slider defaults, in megabytes. |
+
+There is deliberately no way to pin the Java version here. The requirement comes
+from `javaVersion.majorVersion` in the release's own `version.json`, which Mojang
+publishes for every version including the oldest ones (1.7.10 declares 8). A
+manifest that repeated it could only be wrong, and a wrong value is not a
+cosmetic problem — see below.
 
 ## Mods
 
@@ -133,9 +133,9 @@ version of the Java Runtime only recognizes class file versions up to 65.0
 ```
 
 When no local runtime matches, the matching Temurin JDK is downloaded
-automatically. Set `java.supported` (and `java.suggested`) to override the
-requirement — the range is trusted as written, because a server owner may know
-their pack tolerates a different runtime.
+automatically. There is no override: a manifest or instance that disagreed with
+Mojang would reintroduce exactly this crash, and a server owner has no better
+information about which runtime a release was compiled for.
 
 ### Native libraries
 

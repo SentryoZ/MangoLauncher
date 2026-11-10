@@ -27,9 +27,6 @@
         "version": "0.16.9"
       },
       "java": {
-        "supported": ">=17",
-        "suggested": 17,
-        "distribution": "temurin",
         "ram": {
           "recommended": 4096,
           "minimum": 2048
@@ -77,10 +74,6 @@
       "autoConnect": false,
       "loader": {
         "type": "vanilla"
-      },
-      "java": {
-        "supported": ">=21",
-        "suggested": 21
       },
       "mods": [],
       "files": []

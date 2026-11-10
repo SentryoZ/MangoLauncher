@@ -124,7 +124,7 @@ pub async fn run(args: LaunchArgs, data: &DataPaths, config: &Config) -> mango_c
 
     // The required runtime comes from the version metadata, never from the
     // version name: `26.3` needs Java 25 and 1.20.1 needs 17.
-    let requirement = service::java_requirement(&client, &spec, None).await?;
+    let requirement = service::java_requirement(&client, &spec).await?;
     println!("needs    Java {} ({})", requirement.suggested, requirement.supported);
 
     let installations = discover::discover();
@@ -227,9 +227,8 @@ pub async fn launch_instance_with(
     };
     service::validate_spec(&spec)?;
 
-    // Ask the version metadata which Java this release needs; the instance's own
-    // `java` block may override it.
-    let requirement = service::java_requirement(&client, &spec, instance.java.as_ref()).await?;
+    // Ask the version metadata which Java this release needs.
+    let requirement = service::java_requirement(&client, &spec).await?;
     println!("needs    Java {} ({})", requirement.suggested, requirement.supported);
 
     let installations = discover::discover();
