@@ -64,6 +64,8 @@ pub struct UiState {
     pub available_update: Option<mango_core::updater::Update>,
     /// Set once the player dismissed the update banner for this session.
     pub update_dismissed: bool,
+    /// When the current game launch started, for the Discord elapsed timer.
+    pub launch_started_at: Option<u64>,
 }
 
 impl UiState {
@@ -437,6 +439,7 @@ pub struct SettingsDraft {
     pub java_path: String,
     pub jvm_options: String,
     pub manifest_url: String,
+    pub enable_discord_rpc: bool,
 }
 
 impl Default for SettingsDraft {
@@ -457,6 +460,7 @@ impl SettingsDraft {
             java_path: String::new(),
             jvm_options: String::new(),
             manifest_url: config.settings.launcher.manifest_url.clone().unwrap_or_default(),
+            enable_discord_rpc: config.settings.launcher.enable_discord_rpc,
         }
     }
 
@@ -472,6 +476,7 @@ impl SettingsDraft {
         } else {
             Some(self.manifest_url.trim().to_owned())
         };
+        config.settings.launcher.enable_discord_rpc = self.enable_discord_rpc;
     }
 
     /// Keep the resolution inside a sane range.
@@ -924,6 +929,22 @@ mod tests {
 
         state.busy = true;
         assert!(!state.can_launch_instance());
+    }
+
+    #[test]
+    fn the_discord_switch_survives_a_settings_round_trip() {
+        let mut config = Config::default();
+        assert!(config.settings.launcher.enable_discord_rpc, "on by default");
+
+        let mut draft = SettingsDraft::from_config(&config);
+        assert!(draft.enable_discord_rpc);
+
+        draft.enable_discord_rpc = false;
+        draft.apply_to(&mut config);
+        assert!(!config.settings.launcher.enable_discord_rpc);
+
+        let reloaded = SettingsDraft::from_config(&config);
+        assert!(!reloaded.enable_discord_rpc, "the choice must survive a restart");
     }
 
     fn sample_update(version: &str) -> mango_core::updater::Update {

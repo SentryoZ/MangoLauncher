@@ -17,6 +17,7 @@ use mango_core::manifest::{Manifest, ServerEntry};
 use mango_core::mojang::rules::RuleContext;
 use mango_core::net::downloader::Progress as DownloadProgress;
 use mango_core::net::http;
+use mango_core::presence::{Activity, DiscordIpc, PresenceConfig};
 use mango_core::server::ServerStatus;
 
 /// Commands the UI sends to the worker.
@@ -55,6 +56,11 @@ pub enum Command {
     CheckForUpdate { manifest_url: String, allow_prerelease: bool },
     /// Download and apply an update the UI offered.
     ApplyUpdate { update: Box<mango_core::updater::Update>, staging: PathBuf },
+    /// Publish (or clear) the Discord presence card.
+    SetPresence {
+        config: mango_core::presence::PresenceConfig,
+        activity: Box<mango_core::presence::Activity>,
+    },
 }
 
 /// Events the worker sends back to the UI.
@@ -142,8 +148,9 @@ impl RuntimeHandle {
                 };
 
                 let sender = EventSender { events: worker_events, repaint: worker_repaint };
+                let mut presence = PresenceHolder::default();
                 for command in command_rx {
-                    runtime.block_on(run_command(command, &sender));
+                    runtime.block_on(run_command(command, &sender, &mut presence));
                 }
             })
             .expect("could not spawn the launcher worker thread");
@@ -159,6 +166,90 @@ impl RuntimeHandle {
     /// Non-blocking drain of everything the worker produced.
     pub fn poll(&self) -> Vec<Event> {
         self.events.try_iter().collect()
+    }
+}
+
+/// Keeps the Discord connection alive between commands.
+///
+/// The socket is deliberately long-lived: reconnecting on every state change
+/// would flicker the presence card and cost a handshake each time.
+#[derive(Default)]
+struct PresenceHolder {
+    connection: Option<DiscordIpc>,
+    /// Client id the open connection belongs to, so a manifest change reconnects.
+    client_id: String,
+    /// Last activity sent, so identical updates are not written again.
+    last: Option<Activity>,
+}
+
+impl PresenceHolder {
+    fn publish(
+        &mut self,
+        config: &PresenceConfig,
+        activity: Option<&Activity>,
+        sender: &EventSender,
+    ) {
+        // Disabled: drop the card and the connection.
+        if !config.enabled {
+            if self.connection.is_some() {
+                if let Some(connection) = self.connection.as_mut() {
+                    let _ = connection.clear();
+                }
+                self.connection = None;
+                self.client_id.clear();
+                self.last = None;
+                sender.log("Discord presence disabled");
+            }
+            return;
+        }
+
+        // A manifest change means a different Discord application, so the old
+        // handshake is no longer valid.
+        if self.connection.is_some() && self.client_id != config.client_id {
+            self.connection = None;
+            self.last = None;
+        }
+
+        if self.connection.is_none() {
+            match DiscordIpc::connect(&config.client_id) {
+                Ok(connection) => {
+                    sender.log("Discord presence connected");
+                    self.connection = Some(connection);
+                    self.client_id = config.client_id.clone();
+                }
+                Err(err) => {
+                    // Cosmetic: the player does not need an error dialog for this.
+                    sender.log(format!("Discord presence unavailable: {err}"));
+                    return;
+                }
+            }
+        }
+
+        // Discord rejects commands asynchronously, so a bad client id only shows
+        // up on a later reply. Check it before the de-duplication below, or an
+        // unchanged activity would skip the check forever.
+        if let Some(connection) = self.connection.as_mut()
+            && let Some(problem) = connection.take_error()
+        {
+            sender.log(format!("Discord rejected the presence: {problem}"));
+            self.last = None;
+            return;
+        }
+
+        if self.last.as_ref() == activity {
+            return;
+        }
+
+        if let Some(connection) = self.connection.as_mut() {
+            match connection.set_activity(activity) {
+                Ok(()) => self.last = activity.cloned(),
+                Err(err) => {
+                    sender.log(format!("Discord presence stopped: {err}"));
+                    self.connection = None;
+                    self.last = None;
+                }
+            }
+        }
     }
 }
 
@@ -183,7 +274,7 @@ impl EventSender {
     }
 }
 
-async fn run_command(command: Command, sender: &EventSender) {
+async fn run_command(command: Command, sender: &EventSender, presence: &mut PresenceHolder) {
     match command {
         Command::LoadManifest { source, cache_root } => {
             let result = load_manifest(&source, &cache_root).await;
@@ -437,6 +528,9 @@ async fn run_command(command: Command, sender: &EventSender) {
                 }
                 Err(err) => sender.failed("update", err),
             }
+        }
+        Command::SetPresence { config, activity } => {
+            presence.publish(&config, Some(&activity), sender);
         }
     }
 }

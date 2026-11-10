@@ -19,6 +19,7 @@ pub mod mods;
 pub mod mojang;
 pub mod net;
 pub mod paths;
+pub mod presence;
 pub mod server;
 pub mod updater;
 

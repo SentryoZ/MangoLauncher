@@ -20,7 +20,7 @@ bundled browser.
 | M6 | Microsoft + Yggdrasil auth | done (pending Mojang app review) |
 | M7 | Modrinth / CurseForge mods | done |
 | M8 | egui desktop UI | done |
-| M9 | status, RPC, packaging, self-update | partial (status + self-update done) |
+| M9 | status, RPC, packaging, self-update | partial (status + RPC + self-update done) |
 | M10 | player-created instances | done |
 
 Verified on Windows:
@@ -133,6 +133,23 @@ Setup (Azure app registration and Mojang allow-listing) is documented in
 > Sign-in fails at the last step with `HTTP 403` until Mojang approves the
 > client ID. The launcher reports this specifically rather than as a generic
 > failure.
+
+## Discord presence
+
+When the manifest declares a `discord.clientId` and the player leaves the switch
+on, the launcher publishes a Rich Presence card over Discord's local IPC socket:
+"In the launcher" plus the selected server, or "Playing <server>" with the
+Minecraft version once the game is running.
+
+Both conditions are required: the manifest's client id decides which Discord
+application owns the card, and the Setting is the player's consent. Presence is
+cosmetic, so a closed Discord only produces a log line — never a dialog and never
+a failed launch.
+
+The connection is kept open between state changes and an unchanged card is not
+resent, so the elapsed timer does not reset while the game runs. Discord rejects
+commands asynchronously; a refusal (a bad client id, for example) is surfaced in
+the Logs screen rather than silently ignored.
 
 ## Updates
 

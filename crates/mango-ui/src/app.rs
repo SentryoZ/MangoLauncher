@@ -13,6 +13,8 @@ use crate::state::{UiState, View};
 use crate::theme;
 use crate::views;
 
+use mango_core::presence::PresenceConfig;
+
 /// Paths and configuration the UI needs to act on.
 pub struct AppEnv {
     pub data: DataPaths,
@@ -258,6 +260,35 @@ impl MangoApp {
         self.runtime.send(Command::PingServer { address });
     }
 
+    /// Push the current state to Discord.
+    ///
+    /// The worker drops an activity identical to the last one, so calling this
+    /// every frame is cheap.
+    fn maybe_update_presence(&mut self) {
+        let config = PresenceConfig::from_parts(
+            self.env.config.settings.launcher.enable_discord_rpc,
+            self.state.manifest.as_deref(),
+        );
+
+        // Discord shows "elapsed" from this timestamp, so it is taken when the
+        // game starts, not when the launcher opens.
+        let started_at = if self.state.launch_pid.is_some() {
+            Some(*self.state.launch_started_at.get_or_insert_with(mango_core::presence::now_millis))
+        } else {
+            self.state.launch_started_at = None;
+            None
+        };
+
+        let activity = mango_core::presence::activity_for(
+            self.state.manifest.as_deref(),
+            self.state.selected_server_entry(),
+            started_at.is_some(),
+            started_at,
+        );
+
+        self.runtime.send(Command::SetPresence { config, activity: Box::new(activity) });
+    }
+
     /// Download and apply the update the feed offered.
     fn apply_update(&mut self) {
         let Some(update) = self.state.available_update.clone() else { return };
@@ -346,6 +377,7 @@ impl eframe::App for MangoApp {
             self.state.apply(event);
         }
         self.maybe_ping();
+        self.maybe_update_presence();
 
         egui::TopBottomPanel::top("top")
             .frame(egui::Frame::default().inner_margin(egui::Margin::symmetric(14, 8)))

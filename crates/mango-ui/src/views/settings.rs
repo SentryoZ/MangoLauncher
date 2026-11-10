@@ -18,6 +18,22 @@ pub fn draw(
     ui.label(theme::heading("Settings"));
     ui.add_space(8.0);
 
+    // The footer claims its space first. Drawing it after the scroll area would
+    // paint it on top of the Java list, because the scroll area takes whatever
+    // height is left and a `bottom_up` layout shares that space rather than
+    // reserving it.
+    egui::TopBottomPanel::bottom("settings-footer").show_inside(ui, |ui| {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if ui.button("Save").clicked() {
+                *action = Action::SaveSettings;
+            }
+            if env.dirty {
+                ui.label(theme::muted("unsaved changes"));
+            }
+        });
+    });
+
     egui::ScrollArea::vertical().show(ui, |ui| {
         section_minecraft(ui, state);
         ui.add_space(10.0);
@@ -30,17 +46,6 @@ pub fn draw(
         section_about(ui);
         ui.add_space(10.0);
         section_updates(ui, state, action);
-    });
-
-    ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
-        ui.horizontal(|ui| {
-            if ui.button("Save").clicked() {
-                *action = Action::SaveSettings;
-            }
-            if env.dirty {
-                ui.label(theme::muted("unsaved changes"));
-            }
-        });
     });
 }
 
@@ -185,6 +190,12 @@ fn section_launcher(
                 env.dirty = true;
             }
         });
+
+        ui.add_space(10.0);
+        ui.checkbox(&mut state.settings.enable_discord_rpc, "Show what I am playing on Discord");
+        ui.label(theme::muted(
+            "Needs the manifest to publish a Discord client id. Has no effect when Discord is closed.",
+        ));
     });
 }
 
