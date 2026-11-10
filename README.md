@@ -61,6 +61,11 @@ The window has four screens: **Play** (server list, status, PLAY), **Instances**
 manifest, memory, mods), and **Logs**. Long-running work happens on a worker
 thread; the UI never blocks and repaints when results arrive.
 
+The desktop build is a Windows GUI binary, so no console window opens behind it.
+Anything the launcher wants to say to the player — including every `tracing` log
+line — appears on the **Logs** screen, and is also written to
+`logs/mango.log.<date>` for bug reports.
+
 Set a manifest in Settings, or point `settings.launcher.manifestUrl` in
 `config.json` at one. `MANGO_DATA_DIR` overrides the data directory.
 

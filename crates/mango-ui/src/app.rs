@@ -21,6 +21,8 @@ pub struct AppEnv {
     pub game_root: PathBuf,
     pub config: Config,
     pub dirty: bool,
+    /// Lines produced by `tracing`, drained into the Logs screen each frame.
+    pub log_sink: mango_core::logging::LogSink,
 }
 
 pub struct MangoApp {
@@ -406,6 +408,13 @@ impl eframe::App for MangoApp {
         for event in self.runtime.poll() {
             self.state.apply(event);
         }
+
+        // Lines from `tracing` arrive on other threads; moving them into the view
+        // here keeps the Logs screen a single source of truth.
+        for line in self.env.log_sink.drain() {
+            self.state.logs.push(line);
+        }
+
         self.maybe_ping();
         self.maybe_update_presence();
 
