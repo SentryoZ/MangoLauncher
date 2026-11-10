@@ -296,12 +296,12 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     Ok(())
 }
 
-/// Strip a UTF-8 byte-order mark.
+/// Remove a UTF-8 byte-order mark.
 ///
 /// Editors and shells on Windows write BOM-prefixed UTF-8, and `serde_json`
 /// rejects a leading BOM rather than skipping it, so a hand-edited config would
 /// otherwise look corrupt.
-fn strip_bom(text: &str) -> &str {
+pub(crate) fn strip_bom(text: &str) -> &str {
     text.strip_prefix('\u{feff}').unwrap_or(text)
 }
 

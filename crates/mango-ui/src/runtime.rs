@@ -51,6 +51,10 @@ pub enum Command {
     LoadVersions,
     /// Fetch the loader versions for a loader and game version.
     LoadLoaderVersions { kind: mango_core::manifest::LoaderKind, minecraft: String },
+    /// Ask the release feed whether a newer launcher exists.
+    CheckForUpdate { manifest_url: String, allow_prerelease: bool },
+    /// Download and apply an update the UI offered.
+    ApplyUpdate { update: Box<mango_core::updater::Update>, staging: PathBuf },
 }
 
 /// Events the worker sends back to the UI.
@@ -91,6 +95,12 @@ pub enum Event {
         minecraft: String,
         versions: Vec<String>,
     },
+    /// A newer launcher release is available.
+    UpdateAvailable {
+        update: Box<mango_core::updater::Update>,
+    },
+    /// The update feed answered and there is nothing to install.
+    UpToDate,
 }
 
 /// Handle held by the UI.
@@ -375,6 +385,57 @@ async fn run_command(command: Command, sender: &EventSender) {
                     sender.send(Event::ServerStatus { address, status: Box::new(status) })
                 }
                 Err(err) => sender.log(format!("status for {address}: {err}")),
+            }
+        }
+        Command::CheckForUpdate { manifest_url, allow_prerelease } => {
+            let client = match http::build_client() {
+                Ok(client) => client,
+                Err(err) => return sender.failed("update", err),
+            };
+
+            match mango_core::updater::check(&client, &manifest_url, allow_prerelease).await {
+                Ok(Some(update)) => {
+                    sender.log(format!("MangoLauncher {} is available", update.version));
+                    sender.send(Event::UpdateAvailable { update: Box::new(update) });
+                }
+                Ok(None) => sender.send(Event::UpToDate),
+                Err(err) => {
+                    // A release feed that is down or misconfigured must not stop
+                    // anyone from playing, so this is a log line, not an error.
+                    sender.log(format!("could not check for updates: {err}"));
+                    sender.send(Event::UpToDate);
+                }
+            }
+        }
+        Command::ApplyUpdate { update, staging } => {
+            let client = match http::build_client() {
+                Ok(client) => client,
+                Err(err) => return sender.failed("update", err),
+            };
+
+            match mango_core::updater::download(&client, &update, &staging).await {
+                Ok(downloaded) => {
+                    sender.log(format!("downloaded {}", downloaded.display()));
+                    match std::env::current_exe() {
+                        Ok(current) => {
+                            match mango_core::updater::apply(&update, &downloaded, &current) {
+                                Ok(true) => sender.log(format!(
+                                    "MangoLauncher {} is ready; restart to use it",
+                                    update.version
+                                )),
+                                Ok(false) => sender.log("the download was opened"),
+                                Err(err) => sender.failed("update", err),
+                            }
+                        }
+                        Err(err) => sender.failed(
+                            "update",
+                            mango_core::MangoError::Other(format!(
+                                "cannot locate this executable: {err}"
+                            )),
+                        ),
+                    }
+                }
+                Err(err) => sender.failed("update", err),
             }
         }
     }

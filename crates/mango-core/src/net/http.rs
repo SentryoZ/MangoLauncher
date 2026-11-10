@@ -15,7 +15,7 @@ use crate::error::{MangoError, Result};
 
 /// Default user agent sent with every request.
 pub fn user_agent() -> String {
-    format!("MangoLauncher/{} (github.com/example/MangoLauncher)", crate::VERSION)
+    format!("MangoLauncher/{} ({})", crate::VERSION, crate::REPOSITORY)
 }
 
 /// Build a client with sane timeouts and retries left to the caller.

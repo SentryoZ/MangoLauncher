@@ -43,6 +43,12 @@ impl MangoApp {
         // first frame.
         runtime.send(Command::DiscoverJava);
         runtime.send(Command::LoadVersions);
+        // An update check is optional and must never delay the first frame, so it
+        // runs on the worker like everything else.
+        runtime.send(Command::CheckForUpdate {
+            manifest_url: mango_core::updater::default_manifest_url(),
+            allow_prerelease: env.config.settings.launcher.allow_prerelease,
+        });
         if !state.manifest_source.trim().is_empty() {
             runtime.send(Command::LoadManifest {
                 source: state.manifest_source.clone(),
@@ -252,6 +258,61 @@ impl MangoApp {
         self.runtime.send(Command::PingServer { address });
     }
 
+    /// Download and apply the update the feed offered.
+    fn apply_update(&mut self) {
+        let Some(update) = self.state.available_update.clone() else { return };
+
+        // The staging directory is outside the game tree so a partial download is
+        // never treated as game content.
+        self.runtime.send(Command::ApplyUpdate {
+            update: Box::new(update),
+            staging: self.env.data.root().join("update"),
+        });
+    }
+
+    fn check_for_update(&mut self) {
+        // An explicit check overrides an earlier dismissal, otherwise pressing the
+        // button would appear to do nothing.
+        self.state.update_dismissed = false;
+        self.runtime.send(Command::CheckForUpdate {
+            manifest_url: mango_core::updater::default_manifest_url(),
+            allow_prerelease: self.env.config.settings.launcher.allow_prerelease,
+        });
+    }
+
+    /// Banner advertising a newer launcher release.
+    fn update_banner(&self, ui: &mut egui::Ui, action: &mut Action) {
+        let Some(update) = self.state.available_update.as_ref() else { return };
+
+        egui::Frame::default()
+            .fill(theme::ACCENT_DIM)
+            .inner_margin(egui::Margin::symmetric(14, 8))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("MangoLauncher {} is available", update.version))
+                            .strong(),
+                    );
+                    ui.label(theme::muted(format!("you have {}", mango_core::VERSION)));
+
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button("Later").clicked() {
+                            *action = Action::DismissUpdate;
+                        }
+                        if ui.button("Update now").clicked() {
+                            *action = Action::ApplyUpdate;
+                        }
+                    });
+                });
+
+                if let Some(notes) =
+                    update.notes.as_deref().filter(|notes| !notes.trim().is_empty())
+                {
+                    ui.label(theme::muted(notes.lines().next().unwrap_or_default()));
+                }
+            });
+    }
+
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(RichText::new("MANGO").size(18.0).strong().color(theme::ACCENT));
@@ -308,6 +369,10 @@ impl eframe::App for MangoApp {
         // borrow of `state`/`env` ends before an action mutates the app.
         let mut action = Action::None;
 
+        if self.state.available_update.is_some() && !self.state.update_dismissed {
+            egui::TopBottomPanel::top("update").show(ctx, |ui| self.update_banner(ui, &mut action));
+        }
+
         egui::SidePanel::left("servers")
             .resizable(false)
             .exact_width(240.0)
@@ -345,6 +410,9 @@ impl eframe::App for MangoApp {
             Action::DeleteInstance => self.delete_instance(),
             Action::InstallInstance => self.install_instance(),
             Action::LaunchInstance => self.launch_instance(),
+            Action::ApplyUpdate => self.apply_update(),
+            Action::DismissUpdate => self.state.update_dismissed = true,
+            Action::CheckForUpdate => self.check_for_update(),
         }
     }
 }
@@ -362,4 +430,7 @@ pub enum Action {
     DeleteInstance,
     InstallInstance,
     LaunchInstance,
+    ApplyUpdate,
+    DismissUpdate,
+    CheckForUpdate,
 }

@@ -20,11 +20,15 @@ pub mod mojang;
 pub mod net;
 pub mod paths;
 pub mod server;
+pub mod updater;
 
 pub use error::{MangoError, Result};
 
 /// Launcher version, used in user agents and launch arguments.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Project home page, embedded from `Cargo.toml`.
+pub const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
 
 /// Value passed to Minecraft as `launcher_name`.
 pub const LAUNCHER_NAME: &str = "MangoLauncher";

@@ -6,3 +6,4 @@ pub mod instance;
 pub mod java;
 pub mod launch;
 pub mod progress_reporter;
+pub mod update;

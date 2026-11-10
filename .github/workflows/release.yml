@@ -1,0 +1,169 @@
+name: Release
+
+# Builds one artifact per platform and publishes the manifest the launcher's
+# updater reads. Tag a commit (`git tag v0.2.0 && git push --tags`) to cut a
+# release; nothing here runs on ordinary pushes.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish, e.g. 0.2.0 (must match Cargo.toml)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  VERSION: ${{ github.event.inputs.version || github.ref_name }}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows-x86_64
+            artifact: MangoLauncher-windows-x86_64
+            binary: mango-launcher.exe
+          - os: ubuntu-latest
+            platform: linux-x86_64
+            artifact: MangoLauncher-linux-x86_64
+            binary: mango-launcher
+          - os: macos-latest
+            platform: macos-aarch64
+            artifact: MangoLauncher-macos-aarch64
+            binary: mango-launcher
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --workspace
+
+      # The launcher strips its own version into the binary, so a tag that
+      # disagrees with Cargo.toml would silently ship the wrong updater answer.
+      - name: Check the tag matches the crate version
+        shell: bash
+        run: |
+          declared="v$(grep -m1 '^version' Cargo.toml | sed 's/.*= *"\(.*\)"/\1/')"
+          if [ "$declared" != "$VERSION" ]; then
+            echo "::error::tag $VERSION does not match Cargo.toml ($declared)"
+            exit 1
+          fi
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $out = "dist/${{ matrix.artifact }}"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item "target/release/${{ matrix.binary }}" $out
+          Compress-Archive -Path "$out/*" -DestinationPath "dist/${{ matrix.artifact }}.zip"
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          out="dist/${{ matrix.artifact }}"
+          mkdir -p "$out"
+          cp "target/release/${{ matrix.binary }}" "$out/"
+          chmod +x "$out/${{ matrix.binary }}"
+          cp README.md "$out/" 2>/dev/null || true
+          (cd dist && tar -czf "${{ matrix.artifact }}.tar.gz" "${{ matrix.artifact }}")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: |
+            dist/${{ matrix.artifact }}.zip
+            dist/${{ matrix.artifact }}.tar.gz
+          if-no-files-found: ignore
+
+  manifest:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # The updater requires a SHA-256 per asset, so the manifest is generated
+      # from the files that were actually built rather than written by hand.
+      - name: Generate latest.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib
+
+          root = pathlib.Path("dist")
+          version = os.environ["VERSION"].lstrip("v")
+
+          platforms = {}
+          for path in sorted(root.rglob("*")):
+              if not path.is_file():
+                  continue
+              name = path.name
+              if name.endswith(".zip"):
+                  key, kind = "windows-x86_64", "archive"
+              elif name.endswith(".tar.gz"):
+                  # macOS and Linux share the archive suffix; the artifact name
+                  # says which is which.
+                  key = "macos-aarch64" if "macos" in name else "linux-x86_64"
+                  kind = "archive"
+              else:
+                  continue
+
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              platforms[key] = {
+                  "url": f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/releases/download/v{version}/{name}",
+                  "sha256": digest,
+                  "size": path.stat().st_size,
+                  "kind": kind,
+              }
+
+          if not platforms:
+              raise SystemExit("no artifacts to publish")
+
+          manifest = {"version": version, "platforms": platforms}
+          pathlib.Path("latest.json").write_text(json.dumps(manifest, indent=2))
+          print(json.dumps(manifest, indent=2))
+          PY
+        env:
+          VERSION: ${{ env.VERSION }}
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.VERSION }}
+          name: MangoLauncher ${{ env.VERSION }}
+          files: |
+            dist/*.zip
+            dist/*.tar.gz
+            latest.json
+          fail_on_unmatched_files: false
+          generate_release_notes: true
+
+      # The updater reads the manifest from this exact path, so a release without
+      # it would leave every installed launcher unable to update.
+      - name: Verify the manifest followed the launcher's scheme
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, re
+          manifest = json.load(open("latest.json"))
+          assert manifest["platforms"], "no platforms in the published manifest"
+          for key, asset in manifest["platforms"].items():
+              assert re.fullmatch(r"[0-9a-f]{64}", asset["sha256"]), f"bad digest for {key}"
+              assert asset["url"].startswith("https://"), f"insecure url for {key}"
+          print("latest.json is valid:", ", ".join(manifest["platforms"]))
+          PY

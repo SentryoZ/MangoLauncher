@@ -20,7 +20,7 @@ bundled browser.
 | M6 | Microsoft + Yggdrasil auth | done (pending Mojang app review) |
 | M7 | Modrinth / CurseForge mods | done |
 | M8 | egui desktop UI | done |
-| M9 | status, RPC, packaging, self-update | partial (server status done) |
+| M9 | status, RPC, packaging, self-update | partial (status + self-update done) |
 | M10 | player-created instances | done |
 
 Verified on Windows:
@@ -133,6 +133,35 @@ Setup (Azure app registration and Mojang allow-listing) is documented in
 > Sign-in fails at the last step with `HTTP 403` until Mojang approves the
 > client ID. The launcher reports this specifically rather than as a generic
 > failure.
+
+## Updates
+
+The launcher checks a release manifest on startup and shows a banner when a newer
+version exists. The manifest is a small JSON file published with each release; it
+lists a download per platform with a SHA-256 digest that is verified before the
+file is used.
+
+```console
+mango update --check            # report whether a newer version exists
+mango update                    # download, then ask before applying
+mango update --download-only    # stage the download only
+mango update --manifest ./latest.json --check    # use a local manifest
+```
+
+Applying differs per platform and per asset kind:
+
+* `installer` — run it; the installer replaces the launcher.
+* `binary` — swap the executable in place, keeping the old one as `.old`.
+* `archive` — open it so the player can move the files themselves.
+
+A running Windows program cannot overwrite its own image, which is why the
+executable swap renames the old file first. Nothing is applied without a
+confirmation, and a download that fails verification is never written to disk.
+
+Tagging a commit (`git tag v0.2.0 && git push --tags`) runs
+[`.github/workflows/release.yml`](.github/workflows/release.yml), which builds
+each platform, generates `latest.json` from the artifacts it actually built, and
+publishes everything as a GitHub release.
 
 ## Layout
 

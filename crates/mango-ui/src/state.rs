@@ -60,6 +60,10 @@ pub struct UiState {
     pub error: Option<String>,
     pub launch_pid: Option<u32>,
     pub settings: SettingsDraft,
+    /// Newer launcher release the feed advertised, if any.
+    pub available_update: Option<mango_core::updater::Update>,
+    /// Set once the player dismissed the update banner for this session.
+    pub update_dismissed: bool,
 }
 
 impl UiState {
@@ -199,6 +203,11 @@ impl UiState {
                 }
                 self.loader_versions = versions;
             }
+            Event::UpdateAvailable { update } => {
+                self.logs.push(format!("MangoLauncher {} is available", update.version));
+                self.available_update = Some(*update);
+            }
+            Event::UpToDate => {}
         }
     }
 
@@ -915,5 +924,42 @@ mod tests {
 
         state.busy = true;
         assert!(!state.can_launch_instance());
+    }
+
+    fn sample_update(version: &str) -> mango_core::updater::Update {
+        mango_core::updater::Update {
+            version: mango_core::updater::parse_version(version).unwrap(),
+            notes: Some("Faster installs\nFixed a crash".to_owned()),
+            asset: mango_core::updater::PlatformAsset {
+                url: "https://example.com/MangoLauncher-setup.exe".to_owned(),
+                sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    .to_owned(),
+                size: Some(1024),
+                kind: mango_core::updater::AssetKind::Installer,
+            },
+        }
+    }
+
+    #[test]
+    fn an_available_update_is_recorded_and_logged() {
+        let mut state = UiState::new(&Config::default());
+        assert!(state.available_update.is_none());
+
+        state.apply(Event::UpdateAvailable { update: Box::new(sample_update("0.2.0")) });
+
+        let update = state.available_update.as_ref().expect("the update should be kept");
+        assert_eq!(update.version.to_string(), "0.2.0");
+        assert!(
+            state.logs.last().is_some_and(|line| line.contains("0.2.0")),
+            "the player should see the version in the activity log"
+        );
+    }
+
+    #[test]
+    fn an_up_to_date_answer_leaves_no_banner() {
+        let mut state = UiState::new(&Config::default());
+        state.apply(Event::UpToDate);
+        assert!(state.available_update.is_none());
+        assert!(!state.update_dismissed);
     }
 }

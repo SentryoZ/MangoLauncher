@@ -52,6 +52,8 @@ enum Command {
         #[command(subcommand)]
         command: commands::instance::InstanceCommand,
     },
+    /// Check for, download, and apply a launcher update.
+    Update(commands::update::UpdateArgs),
     /// Install a stored instance, optionally launching it.
     Run {
         /// Instance id.
@@ -123,6 +125,7 @@ async fn run(cli: Cli, data_paths: DataPaths) -> mango_core::Result<()> {
         Command::Instance { command } => {
             commands::instance::run(command, &data_paths, &config).await
         }
+        Command::Update(args) => commands::update::run(args, &data_paths).await,
         Command::Run { id, launch, attached, username } => {
             commands::instance::install_with(
                 &id,

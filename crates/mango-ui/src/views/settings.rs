@@ -28,6 +28,8 @@ pub fn draw(
         section_mods(ui, state);
         ui.add_space(10.0);
         section_about(ui);
+        ui.add_space(10.0);
+        section_updates(ui, state, action);
     });
 
     ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
@@ -230,5 +232,38 @@ fn section_about(ui: &mut egui::Ui) {
         ui.label(theme::muted(
             "Game files are downloaded from Mojang's official servers and never redistributed.",
         ));
+    });
+}
+
+fn section_updates(ui: &mut egui::Ui, state: &UiState, action: &mut Action) {
+    card(ui, "UPDATES", |ui| match state.available_update.as_ref() {
+        Some(update) => {
+            ui.label(RichText::new(format!("Version {} is available", update.version)).strong());
+            if let Some(notes) = update.notes.as_deref().filter(|notes| !notes.trim().is_empty()) {
+                ui.add_space(4.0);
+                for line in notes.lines().take(6) {
+                    ui.label(theme::muted(line));
+                }
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Download and install").clicked() {
+                    *action = Action::ApplyUpdate;
+                }
+                if ui.button("Later").clicked() {
+                    *action = Action::DismissUpdate;
+                }
+            });
+        }
+        None => {
+            ui.label(theme::muted(format!(
+                "You are running MangoLauncher {}.",
+                mango_core::VERSION
+            )));
+            ui.add_space(6.0);
+            if ui.button("Check for updates").clicked() {
+                *action = Action::CheckForUpdate;
+            }
+        }
     });
 }

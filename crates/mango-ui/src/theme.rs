@@ -14,6 +14,8 @@ pub const BG_PANEL: Color32 = Color32::from_rgb(0x1f, 0x1e, 0x1b);
 pub const BG_RAISED: Color32 = Color32::from_rgb(0x2a, 0x28, 0x24);
 /// Primary accent, used for the PLAY button and selection.
 pub const ACCENT: Color32 = Color32::from_rgb(0xe8, 0x9c, 0x2e);
+/// Muted accent for informational banners, dark enough to keep text readable.
+pub const ACCENT_DIM: Color32 = Color32::from_rgb(0x3a, 0x2e, 0x1c);
 pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(0xee, 0xec, 0xe7);
 pub const TEXT_MUTED: Color32 = Color32::from_rgb(0x9a, 0x96, 0x8d);
 pub const DANGER: Color32 = Color32::from_rgb(0xd9, 0x53, 0x4f);
