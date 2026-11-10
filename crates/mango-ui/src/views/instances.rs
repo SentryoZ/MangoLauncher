@@ -29,7 +29,7 @@ pub fn draw(
 
     egui::CentralPanel::default().show_inside(ui, |ui| {
         if let Some(instance) = state.selected_user_instance().cloned() {
-            details(ui, &instance, state, env, action);
+            details(ui, &instance, state, env, runtime, action);
         } else {
             empty_state(ui, state);
         }
@@ -91,6 +91,7 @@ fn details(
     instance: &mango_core::instance::UserInstance,
     state: &mut UiState,
     env: &AppEnv,
+    runtime: &RuntimeHandle,
     action: &mut Action,
 ) {
     ui.horizontal(|ui| {
@@ -119,9 +120,13 @@ fn details(
                 ui.end_row();
 
                 ui.label(theme::section("JAVA"));
-                let requirement =
-                    mango_core::java::requirement_for(&instance.minecraft, instance.java.as_ref());
-                ui.label(RichText::new(format!("Java {}", requirement.suggested)).strong());
+                // The metadata answer is authoritative; the fallback is only for
+                // the moment before it arrives.
+                let major = state
+                    .java_major_for(&instance.minecraft)
+                    .map(|major| major.to_string())
+                    .unwrap_or_else(|| "…".to_owned());
+                ui.label(RichText::new(format!("Java {major}")).strong());
                 ui.end_row();
 
                 ui.label(theme::section("ID"));
@@ -133,6 +138,12 @@ fn details(
                 ui.end_row();
             });
         });
+
+    // The Java requirement comes from the version metadata, which needs a network
+    // round-trip, so it is asked for once per distinct version.
+    if state.java_major_for(&instance.minecraft).is_none() {
+        runtime.send(Command::LoadJavaRequirement { minecraft: instance.minecraft.clone() });
+    }
 
     ui.add_space(14.0);
 

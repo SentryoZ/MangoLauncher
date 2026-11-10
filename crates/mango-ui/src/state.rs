@@ -72,6 +72,8 @@ pub struct UiState {
         Option<(mango_core::presence::PresenceConfig, mango_core::presence::Activity)>,
     /// Id of the instance the running game was started from, if any.
     pub running_instance_id: Option<String>,
+    /// Java major per Minecraft version, read from metadata.
+    pub java_requirements: std::collections::HashMap<String, u32>,
 }
 
 impl UiState {
@@ -233,7 +235,18 @@ impl UiState {
                 self.available_update = Some(*update);
             }
             Event::UpToDate => {}
+            Event::JavaRequirementResolved { minecraft, major } => {
+                self.java_requirements.insert(minecraft, major);
+            }
         }
+    }
+
+    /// Java major a version needs, when the metadata reply has arrived.
+    ///
+    /// Returns `None` rather than a guess: showing the wrong runtime is what
+    /// produced `Unsupported class file major version` in the first place.
+    pub fn java_major_for(&self, minecraft: &str) -> Option<u32> {
+        self.java_requirements.get(minecraft).copied()
     }
 
     /// Replace the manifest, keeping the selection when it is still valid.
@@ -968,6 +981,21 @@ mod tests {
 
         let reloaded = SettingsDraft::from_config(&config);
         assert!(!reloaded.enable_discord_rpc, "the choice must survive a restart");
+    }
+
+    #[test]
+    fn a_java_requirement_is_not_guessed_before_metadata_arrives() {
+        // Launching from the server list used to guess the requirement from the
+        // version name, which gets `26.3` wrong (21 instead of 25) and crashes the
+        // game with `Unsupported class file major version`.
+        let mut state = UiState::new(&Config::default());
+        assert_eq!(state.java_major_for("26.3"), None, "nothing is known yet");
+
+        state.apply(Event::JavaRequirementResolved { minecraft: "26.3".to_owned(), major: 25 });
+        assert_eq!(state.java_major_for("26.3"), Some(25));
+
+        // Other versions keep their own answer.
+        assert_eq!(state.java_major_for("1.20.1"), None);
     }
 
     fn sample_update(version: &str) -> mango_core::updater::Update {

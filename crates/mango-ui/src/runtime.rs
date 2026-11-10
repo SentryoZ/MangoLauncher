@@ -61,6 +61,8 @@ pub enum Command {
         config: mango_core::presence::PresenceConfig,
         activity: Box<mango_core::presence::Activity>,
     },
+    /// Resolve the Java a Minecraft version needs, from its metadata.
+    LoadJavaRequirement { minecraft: String },
 }
 
 /// Events the worker sends back to the UI.
@@ -111,6 +113,11 @@ pub enum Event {
     },
     /// The update feed answered and there is nothing to install.
     UpToDate,
+    /// Java major a Minecraft version needs, per its metadata.
+    JavaRequirementResolved {
+        minecraft: String,
+        major: u32,
+    },
 }
 
 /// Handle held by the UI.
@@ -542,6 +549,41 @@ async fn run_command(command: Command, sender: &EventSender, presence: &mut Pres
         Command::SetPresence { config, activity } => {
             presence.publish(&config, Some(&activity), sender);
         }
+        Command::LoadJavaRequirement { minecraft } => {
+            let client = match http::build_client() {
+                Ok(client) => client,
+                Err(err) => return sender.failed("java", err),
+            };
+
+            // Ask the metadata, not the version id: `26.3` needs Java 25 while the
+            // id itself says nothing about a runtime.
+            let spec = mango_core::launch::LaunchSpec {
+                minecraft_version: minecraft.clone(),
+                version_name: minecraft.clone(),
+                game_directory: PathBuf::new(),
+                java_executable: PathBuf::new(),
+                account: mango_core::launch::LaunchAccount::offline("Player"),
+                loader: mango_core::manifest::LoaderSpec::default(),
+                detached: true,
+                resolution: None,
+                fullscreen: false,
+                jvm_options: Vec::new(),
+                java_agents: Vec::new(),
+                auto_connect: None,
+            };
+
+            match mango_core::launch::service::java_requirement(&client, &spec, None).await {
+                Ok(requirement) => sender.send(Event::JavaRequirementResolved {
+                    minecraft,
+                    major: requirement.suggested,
+                }),
+                Err(err) => {
+                    // A version without metadata still has to show something, so
+                    // this is a log line rather than a failure dialog.
+                    sender.log(format!("could not read the Java version for {minecraft}: {err}"));
+                }
+            }
+        }
     }
 }
 
@@ -716,9 +758,29 @@ async fn select_java(
     preferred: PathBuf,
     sender: &EventSender,
 ) -> Result<PathBuf> {
-    use mango_core::java::{JavaChoice, choose_java, requirement_for};
+    use mango_core::java::JavaChoice;
 
-    let requirement = requirement_for(&server.minecraft, server.java.as_ref());
+    // Read the requirement the same way the launch will: from the version
+    // metadata, which is the only reliable source. Guessing from the version id
+    // gets `26.3` wrong (it needs Java 25 but the id carries no hint), and the
+    // wrong runtime surfaces as `Unsupported class file major version`.
+    let probe = mango_core::launch::LaunchSpec {
+        minecraft_version: server.minecraft.clone(),
+        version_name: server.id.clone(),
+        game_directory: PathBuf::new(),
+        java_executable: PathBuf::new(),
+        account: mango_core::launch::LaunchAccount::offline("Player"),
+        loader: server.loader.clone(),
+        detached: true,
+        resolution: None,
+        fullscreen: false,
+        jvm_options: Vec::new(),
+        java_agents: Vec::new(),
+        auto_connect: None,
+    };
+
+    let requirement =
+        mango_core::launch::service::java_requirement(client, &probe, server.java.as_ref()).await?;
     let installations = java::discover::discover();
 
     sender.log(format!(
@@ -735,7 +797,7 @@ async fn select_java(
     // The runtime picked in Settings acts as a pin.
     let pinned = preferred.to_str();
 
-    match choose_java(&installations, &requirement, pinned) {
+    match java::choose_java(&installations, &requirement, pinned) {
         JavaChoice::Installed(java) => Ok(java.executable),
         JavaChoice::NeedsDownload { major, reason } => {
             sender.log(format!("{reason}; downloading Java {major}"));
