@@ -434,13 +434,33 @@ impl DiscordIpc {
     }
 }
 
+/// What the player is on, from the manifest or a self-created instance.
+///
+/// Both kinds of instance reach the same card, so the presence layer takes a
+/// neutral pair rather than a `ServerEntry`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PresenceTarget {
+    pub name: String,
+    pub minecraft: String,
+}
+
+impl PresenceTarget {
+    pub fn new(name: impl Into<String>, minecraft: impl Into<String>) -> Self {
+        Self { name: name.into(), minecraft: minecraft.into() }
+    }
+
+    pub fn from_server(server: &crate::manifest::ServerEntry) -> Self {
+        Self::new(&server.name, &server.minecraft)
+    }
+}
+
 /// Build the presence card for the launcher's current state.
 ///
 /// Kept separate from the connection so the wording can be tested without a
 /// running Discord.
 pub fn activity_for(
     manifest: Option<&crate::manifest::Manifest>,
-    server: Option<&crate::manifest::ServerEntry>,
+    target: Option<&PresenceTarget>,
     playing: bool,
     started_at: Option<u64>,
 ) -> Activity {
@@ -452,13 +472,13 @@ pub fn activity_for(
         small_text: base.and_then(|d| d.small_image_text.clone()),
     };
 
-    let (details, state) = match (server, playing) {
-        (Some(server), true) => {
-            (format!("Playing {}", server.name), format!("Minecraft {}", server.minecraft))
+    let (details, state) = match (target, playing) {
+        (Some(target), true) => {
+            (format!("Playing {}", target.name), format!("Minecraft {}", target.minecraft))
         }
-        (Some(server), false) => (
+        (Some(target), false) => (
             "In the launcher".to_owned(),
-            format!("{} · Minecraft {}", server.name, server.minecraft),
+            format!("{} · Minecraft {}", target.name, target.minecraft),
         ),
         (None, _) => ("In the launcher".to_owned(), "Choosing a server".to_owned()),
     };
@@ -705,9 +725,9 @@ mod tests {
     #[test]
     fn the_card_names_the_selected_server_in_the_launcher() {
         let manifest = manifest_with_discord("1");
-        let server = manifest.server("main");
+        let target = PresenceTarget::from_server(manifest.server("main").unwrap());
 
-        let activity = activity_for(Some(&manifest), server, false, None);
+        let activity = activity_for(Some(&manifest), Some(&target), false, None);
         assert_eq!(activity.details.as_deref(), Some("In the launcher"));
         assert_eq!(activity.state.as_deref(), Some("Mango Survival · Minecraft 1.20.1"));
         assert!(activity.started_at.is_none(), "no timer before the game starts");
@@ -716,12 +736,24 @@ mod tests {
     #[test]
     fn the_card_says_playing_once_the_game_runs() {
         let manifest = manifest_with_discord("1");
-        let server = manifest.server("main");
+        let target = PresenceTarget::from_server(manifest.server("main").unwrap());
 
-        let activity = activity_for(Some(&manifest), server, true, Some(1_700_000_000_000));
+        let activity = activity_for(Some(&manifest), Some(&target), true, Some(1_700_000_000_000));
         assert_eq!(activity.details.as_deref(), Some("Playing Mango Survival"));
         assert_eq!(activity.state.as_deref(), Some("Minecraft 1.20.1"));
         assert_eq!(activity.started_at, Some(1_700_000_000_000));
+    }
+
+    #[test]
+    fn a_player_created_instance_is_named_even_though_the_manifest_never_lists_it() {
+        // Self-created instances are not servers, so the card must take its name
+        // from the instance rather than from the sidebar selection.
+        let manifest = manifest_with_discord("1");
+        let target = PresenceTarget::new("My 1.12.2 Pack", "1.12.2");
+
+        let activity = activity_for(Some(&manifest), Some(&target), true, Some(1_700_000_000_000));
+        assert_eq!(activity.details.as_deref(), Some("Playing My 1.12.2 Pack"));
+        assert_eq!(activity.state.as_deref(), Some("Minecraft 1.12.2"));
     }
 
     #[test]
@@ -736,7 +768,8 @@ mod tests {
     #[test]
     fn images_come_from_the_manifest() {
         let manifest = manifest_with_discord("1");
-        let activity = activity_for(Some(&manifest), manifest.server("main"), false, None);
+        let target = PresenceTarget::from_server(manifest.server("main").unwrap());
+        let activity = activity_for(Some(&manifest), Some(&target), false, None);
 
         assert_eq!(activity.assets.large_image.as_deref(), Some("mango-large"));
         assert_eq!(activity.assets.large_text.as_deref(), Some("Mango Network"));

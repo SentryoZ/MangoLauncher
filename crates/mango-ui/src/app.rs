@@ -115,6 +115,8 @@ impl MangoApp {
         self.state.busy = true;
         self.state.error = None;
         self.state.launch_pid = None;
+        // A server launch replaces any instance the presence was naming.
+        self.state.running_instance_id = None;
 
         self.runtime
             .send(Command::Install { server: Box::new(server.clone()), roots: roots.clone() });
@@ -241,11 +243,14 @@ impl MangoApp {
             roots: roots.clone(),
         });
         self.runtime.send(Command::LaunchInstance {
-            instance: Box::new(instance),
+            instance: Box::new(instance.clone()),
             roots,
             username: self.state.selected_username().unwrap_or("Player").to_owned(),
             detached: self.state.settings.launch_detached,
         });
+        // Remembered so the presence card can name the instance; it is not in the
+        // manifest, so the sidebar selection cannot supply it.
+        self.state.running_instance_id = Some(instance.id);
     }
 
     fn maybe_ping(&mut self) {
@@ -262,8 +267,8 @@ impl MangoApp {
 
     /// Push the current state to Discord.
     ///
-    /// The worker drops an activity identical to the last one, so calling this
-    /// every frame is cheap.
+    /// Returns without sending when nothing changed: every `send` wakes the UI for
+    /// a repaint, so an unconditional send here would keep the event loop spinning.
     fn maybe_update_presence(&mut self) {
         let config = PresenceConfig::from_parts(
             self.env.config.settings.launcher.enable_discord_rpc,
@@ -279,14 +284,39 @@ impl MangoApp {
             None
         };
 
+        // A player-created instance is not in the manifest, so the target is built
+        // from whichever view the game was started from.
+        let target = self.presence_target();
         let activity = mango_core::presence::activity_for(
             self.state.manifest.as_deref(),
-            self.state.selected_server_entry(),
+            target.as_ref(),
             started_at.is_some(),
             started_at,
         );
 
-        self.runtime.send(Command::SetPresence { config, activity: Box::new(activity) });
+        let current = (config, activity);
+        if self.state.last_presence.as_ref() == Some(&current) {
+            return;
+        }
+        self.state.last_presence = Some(current.clone());
+
+        self.runtime
+            .send(Command::SetPresence { config: current.0, activity: Box::new(current.1) });
+    }
+
+    /// What to name on the presence card.
+    ///
+    /// A running instance wins over the sidebar selection, because that is what the
+    /// player is actually doing.
+    fn presence_target(&self) -> Option<mango_core::presence::PresenceTarget> {
+        if let Some(instance) = self.state.running_instance() {
+            return Some(mango_core::presence::PresenceTarget::new(
+                &instance.name,
+                &instance.minecraft,
+            ));
+        }
+
+        self.state.selected_server_entry().map(mango_core::presence::PresenceTarget::from_server)
     }
 
     /// Download and apply the update the feed offered.

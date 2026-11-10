@@ -66,6 +66,12 @@ pub struct UiState {
     pub update_dismissed: bool,
     /// When the current game launch started, for the Discord elapsed timer.
     pub launch_started_at: Option<u64>,
+    /// The presence card last handed to the worker, so an unchanged one is not
+    /// resent every frame.
+    pub last_presence:
+        Option<(mango_core::presence::PresenceConfig, mango_core::presence::Activity)>,
+    /// Id of the instance the running game was started from, if any.
+    pub running_instance_id: Option<String>,
 }
 
 impl UiState {
@@ -95,6 +101,15 @@ impl UiState {
 
     pub fn selected_user_instance(&self) -> Option<&UserInstance> {
         let id = self.selected_instance.as_deref()?;
+        self.user_instances.iter().find(|instance| instance.id == id)
+    }
+
+    /// The instance the running game belongs to, if it was started from one.
+    ///
+    /// A game started from the server list has no instance id, so this returns
+    /// `None` and the presence falls back to the selected server.
+    pub fn running_instance(&self) -> Option<&UserInstance> {
+        let id = self.running_instance_id.as_deref()?;
         self.user_instances.iter().find(|instance| instance.id == id)
     }
 
@@ -163,6 +178,14 @@ impl UiState {
                 self.busy = false;
                 self.progress = None;
                 self.error = None;
+            }
+            Event::GameExited { pid } => {
+                // Ignore a late report for a launch the player already replaced.
+                if pid.is_none() || pid == self.launch_pid {
+                    self.launch_pid = None;
+                    self.launch_started_at = None;
+                    self.running_instance_id = None;
+                }
             }
             Event::Log(line) => self.logs.push(line),
             Event::Failed { context, message } => {

@@ -58,6 +58,62 @@ impl GameProcess {
     }
 }
 
+/// Wait for a process to exit without owning it.
+///
+/// A detached launch hands the child to the OS and the launcher drops the handle,
+/// so awaiting the handle is not possible. Polling is the portable way to learn
+/// when the game closed: Windows has no waitable handle for an unrelated process
+/// and neither does a re-parented Unix process.
+///
+/// Returns immediately when `pid` is already gone.
+pub fn wait_for_exit(pid: u32, interval: std::time::Duration) -> u32 {
+    loop {
+        if !is_running(pid) {
+            return pid;
+        }
+        std::thread::sleep(interval);
+    }
+}
+
+/// Whether a process with this pid is still alive.
+#[cfg(windows)]
+pub fn is_running(pid: u32) -> bool {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut std::ffi::c_void;
+        fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+        fn WaitForSingleObject(handle: *mut std::ffi::c_void, millis: u32) -> u32;
+    }
+
+    /// Poll only: the caller sleeps, this must not block.
+    const WAIT_OBJECT_0: u32 = 0;
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+
+    unsafe {
+        let handle = OpenProcess(SYNCHRONIZE, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+
+        // A process object stays queryable after the process exits, so existence
+        // is not the same as being alive: only a signalled handle means it ended.
+        let state = WaitForSingleObject(handle, 0);
+        CloseHandle(handle);
+        state != WAIT_OBJECT_0
+    }
+}
+
+#[cfg(unix)]
+pub fn is_running(pid: u32) -> bool {
+    // Signal 0 checks for existence without delivering anything.
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    // `kill` also succeeds for a zombie; worth noting but not worth a waitpid
+    // that would race with the parent.
+    unsafe { kill(pid as i32, 0) == 0 }
+}
+
 /// Start the game.
 pub async fn spawn(request: LaunchRequest) -> Result<GameProcess> {
     if !request.java_executable.is_file() {
@@ -212,6 +268,47 @@ mod tests {
     #[test]
     fn natives_root_is_under_temp() {
         assert_eq!(natives_root(Path::new("/tmp")), PathBuf::from("/tmp/mango-natives"));
+    }
+
+    #[test]
+    fn this_test_process_is_reported_as_running() {
+        assert!(is_running(std::process::id()), "the current process must count as alive");
+    }
+
+    #[test]
+    fn a_process_that_does_not_exist_is_not_running() {
+        // Pid 0 is the idle process on Windows and the process group on Unix;
+        // neither can be opened as a running child of this launcher.
+        assert!(!is_running(0), "pid 0 must not look like a live game");
+    }
+
+    #[test]
+    fn waiting_for_an_absent_process_returns_immediately() {
+        let start = std::time::Instant::now();
+        wait_for_exit(0, std::time::Duration::from_millis(50));
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "a gone process must not be waited on"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_real_process_stops_counting_as_running_once_it_exits() {
+        // Detached launches rely on this: no handle is kept, so the pid is the
+        // only signal that the game closed.
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit", "0"])
+            .spawn()
+            .expect("could not start a helper process");
+        let pid = child.id();
+
+        child.wait().expect("the helper should exit");
+
+        // Windows recycles pids, so a brief delay avoids reporting a pid that is
+        // still closing rather than a live process.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!is_running(pid), "an exited process must not report as running");
     }
 
     #[tokio::test]

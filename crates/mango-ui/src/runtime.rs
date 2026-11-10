@@ -82,6 +82,10 @@ pub enum Event {
     Launched {
         pid: Option<u32>,
     },
+    /// The game process ended, detected even when it was launched detached.
+    GameExited {
+        pid: Option<u32>,
+    },
     /// Human-readable log line for the activity panel.
     Log(String),
     Failed {
@@ -253,6 +257,7 @@ impl PresenceHolder {
     }
 }
 
+#[derive(Clone)]
 struct EventSender {
     events: Sender<Event>,
     repaint: Arc<dyn Fn() + Send + Sync>,
@@ -378,6 +383,11 @@ async fn run_command(command: Command, sender: &EventSender, presence: &mut Pres
                             Err(err) => sender.failed("launch", err),
                         }
                         sender.send(Event::Finished { context: "launch".to_owned() });
+                    } else {
+                        // Detached: the handle is dropped, so the exit has to be
+                        // detected another way or the presence would claim the
+                        // game is running forever.
+                        watch_detached_exit(pid, sender);
                     }
                 }
                 Err(err) => sender.failed("launch", err),
@@ -649,10 +659,33 @@ async fn launch_user_instance(
                     Err(err) => sender.failed("launch", err),
                 }
                 sender.send(Event::Finished { context: "launch".to_owned() });
+            } else {
+                watch_detached_exit(pid, sender);
             }
         }
         Err(err) => sender.failed("launch", err),
     }
+}
+
+/// Report when a detached game closes.
+///
+/// The launcher has no handle to the process after a detached launch, so the pid
+/// is polled on a background thread. Polling stops as soon as the process is gone
+/// or the event channel is closed (the launcher exited).
+fn watch_detached_exit(pid: Option<u32>, sender: &EventSender) {
+    let Some(pid) = pid else { return };
+
+    let sender = sender.clone();
+    std::thread::Builder::new()
+        .name("mango-game-watch".to_owned())
+        .spawn(move || {
+            // One second is frequent enough for a presence timer and cheap enough
+            // to leave running for a long session.
+            mango_core::launch::process::wait_for_exit(pid, std::time::Duration::from_secs(1));
+            sender.send(Event::GameExited { pid: Some(pid) });
+            sender.log("game exited");
+        })
+        .ok();
 }
 
 /// Fetch release version ids, newest first.
