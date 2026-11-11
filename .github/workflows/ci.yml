@@ -1,9 +1,9 @@
 name: CI
 
+# Manual only. Every trigger costs three runner-minutes (one per OS), so a check
+# runs when someone asks for it rather than on every push.
 on:
-  push:
-    branches: [main, master]
-  pull_request:
+  workflow_dispatch:
 
 jobs:
   check:
