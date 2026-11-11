@@ -42,9 +42,15 @@ pub fn draw(ui: &mut egui::Ui, state: &mut UiState, env: &AppEnv, action: &mut A
             ui.horizontal(|ui| {
                 ui.label(theme::section("ACCOUNT"));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let name = state.selected_username().unwrap_or("none").to_owned();
-                    ui.label(RichText::new(name).strong());
-                    ui.label(theme::muted("offline profile"));
+                    match state.accounts.selected(state.selected_account) {
+                        Some(account) => {
+                            ui.label(RichText::new(account.username()).strong());
+                            ui.label(theme::muted(account.kind_label()));
+                        }
+                        None => {
+                            ui.label(theme::muted("none"));
+                        }
+                    }
                 });
             });
 

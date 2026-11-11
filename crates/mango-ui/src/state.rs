@@ -47,8 +47,8 @@ pub struct UiState {
     pub showing_form: bool,
     /// In-progress instance form.
     pub new_instance: InstanceForm,
-    /// Offline profile names, until real authentication lands.
-    pub accounts: Vec<String>,
+    /// Signed-in accounts plus the implicit offline profile.
+    pub accounts: AccountList,
     pub selected_account: Option<usize>,
     pub java: Vec<JavaInstallation>,
     pub selected_java: Option<usize>,
@@ -74,20 +74,44 @@ pub struct UiState {
     pub running_instance_id: Option<String>,
     /// Java major per Minecraft version, read from metadata.
     pub java_requirements: std::collections::HashMap<String, u32>,
+    /// Uuid the account list should select once the config is reloaded.
+    pub pending_select_account: Option<String>,
+    /// Authorisation URL for a sign-in that is waiting for the browser redirect.
+    pub sign_in_url: Option<String>,
 }
 
 impl UiState {
     pub fn new(config: &Config) -> Self {
-        let mut state = Self {
+        let offline = default_username();
+        let accounts = AccountList::from_config(config, &offline);
+
+        // Preselect the account the config remembers, falling back to the offline
+        // profile so PLAY is usable before anyone signs in.
+        let selected_account = config
+            .selected_account
+            .as_deref()
+            .and_then(|uuid| accounts.index_of(uuid))
+            .or_else(|| Some(accounts.offline_index()));
+
+        Self {
             manifest_source: config.settings.launcher.manifest_url.clone().unwrap_or_default(),
             settings: SettingsDraft::from_config(config),
+            accounts,
+            selected_account,
             ..Default::default()
-        };
+        }
+    }
 
-        // Seed a profile so the PLAY button works before accounts exist.
-        state.accounts.push(default_username());
-        state.selected_account = Some(0);
-        state
+    /// Rebuild the account list from the config after a sign-in or removal.
+    ///
+    /// `keep` is the uuid to select when it still exists; otherwise the offline
+    /// profile is selected.
+    pub fn reload_accounts(&mut self, config: &Config, keep: Option<&str>) {
+        let offline = default_username();
+        self.accounts = AccountList::from_config(config, &offline);
+        self.selected_account = keep
+            .and_then(|uuid| self.accounts.index_of(uuid))
+            .or_else(|| Some(self.accounts.offline_index()));
     }
 
     /// Reload user instances from disk.
@@ -132,7 +156,18 @@ impl UiState {
     }
 
     pub fn selected_username(&self) -> Option<&str> {
-        self.selected_account.and_then(|index| self.accounts.get(index)).map(String::as_str)
+        self.accounts.selected(self.selected_account).map(Account::username)
+    }
+
+    /// The selected account when it is a real signed-in one.
+    ///
+    /// `None` for the offline profile, which is what launch uses to decide whether
+    /// to fetch a token.
+    pub fn selected_signed_in(&self) -> Option<&SignedInAccount> {
+        match self.accounts.selected(self.selected_account) {
+            Some(Account::Microsoft(account)) => Some(account),
+            _ => None,
+        }
     }
 
     pub fn selected_java_install(&self) -> Option<&JavaInstallation> {
@@ -195,6 +230,11 @@ impl UiState {
                 self.loading_manifest = false;
                 self.pinging = false;
                 self.progress = None;
+                // A failed sign-in leaves no redirect coming, so the waiting banner
+                // must not stay on screen.
+                if context == "sign-in" {
+                    self.sign_in_url = None;
+                }
                 self.error = Some(format!("{context}: {message}"));
                 self.logs.push(format!("ERROR ({context}): {message}"));
             }
@@ -237,6 +277,26 @@ impl UiState {
             Event::UpToDate => {}
             Event::JavaRequirementResolved { minecraft, major } => {
                 self.java_requirements.insert(minecraft, major);
+            }
+            Event::SignedIn { uuid, username } => {
+                // The list itself is rebuilt by the app, which owns the config.
+                self.logs.push(format!("signed in as {username}"));
+                self.pending_select_account = Some(uuid);
+                self.sign_in_url = None;
+                self.error = None;
+            }
+            Event::SignInUrl { url } => {
+                // Kept visible until it completes, so a browser that never opened is
+                // recoverable by copying the URL.
+                self.sign_in_url = Some(url);
+            }
+            Event::Removed { uuid } => {
+                self.logs.push(format!("removed account {uuid}"));
+                self.pending_select_account = None;
+            }
+            Event::Refreshed { username, .. } => {
+                self.logs.push(format!("refreshed the token for {username}"));
+                self.error = None;
             }
         }
     }
@@ -526,6 +586,119 @@ pub fn default_username() -> String {
     "Player".to_owned()
 }
 
+/// A signed-in account, as the UI needs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedInAccount {
+    /// Key in `config.accounts`, needed to refresh and to remove it.
+    pub uuid: String,
+    pub username: String,
+    /// Unix seconds when the Minecraft token expires, for a "needs refresh" hint.
+    pub expires_at: Option<i64>,
+    pub kind: mango_core::config::AccountKind,
+}
+
+/// The offline profile, always available so the launcher works with no sign-in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfflineProfile {
+    pub username: String,
+}
+
+/// One row in the account picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Account {
+    Microsoft(SignedInAccount),
+    Yggdrasil(SignedInAccount),
+    Offline(OfflineProfile),
+}
+
+impl Account {
+    pub fn username(&self) -> &str {
+        match self {
+            Self::Microsoft(account) | Self::Yggdrasil(account) => &account.username,
+            Self::Offline(profile) => &profile.username,
+        }
+    }
+
+    /// Short label shown next to the name.
+    pub fn kind_label(&self) -> &'static str {
+        match self {
+            Self::Microsoft(_) => "Microsoft",
+            Self::Yggdrasil(_) => "Yggdrasil",
+            Self::Offline(_) => "offline profile",
+        }
+    }
+
+    /// Whether this account can join an online server.
+    pub fn is_online(&self) -> bool {
+        !matches!(self, Self::Offline(_))
+    }
+}
+
+/// Signed-in accounts followed by the offline profile.
+///
+/// The offline profile is kept last and cannot be removed, so there is always a
+/// valid selection even if every stored account is deleted.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AccountList {
+    pub entries: Vec<Account>,
+}
+
+impl AccountList {
+    /// Build from the persisted config, in stable uuid order.
+    ///
+    /// The offline profile is appended last, using `offline` as its name.
+    pub fn from_config(config: &Config, offline: &str) -> Self {
+        let mut entries: Vec<Account> = config
+            .accounts
+            .values()
+            .map(|meta| {
+                let account = SignedInAccount {
+                    uuid: meta.uuid.clone(),
+                    username: meta.username.clone(),
+                    expires_at: meta.expires_at,
+                    kind: meta.kind,
+                };
+                match meta.kind {
+                    mango_core::config::AccountKind::Microsoft => Account::Microsoft(account),
+                    _ => Account::Yggdrasil(account),
+                }
+            })
+            .collect();
+
+        // Selecting the stored account last used is the least surprising default.
+        entries.sort_by(|a, b| a.username().cmp(b.username()));
+
+        entries.push(Account::Offline(OfflineProfile { username: offline.to_owned() }));
+        Self { entries }
+    }
+
+    pub fn get(&self, index: usize) -> Option<&Account> {
+        self.entries.get(index)
+    }
+
+    pub fn selected(&self, index: Option<usize>) -> Option<&Account> {
+        index.and_then(|index| self.get(index))
+    }
+
+    /// Index of the offline profile, which always exists.
+    pub fn offline_index(&self) -> usize {
+        self.entries.len().saturating_sub(1)
+    }
+
+    /// Index of the account with this uuid, if still present.
+    pub fn index_of(&self, uuid: &str) -> Option<usize> {
+        self.entries.iter().position(|account| match account {
+            Account::Microsoft(account) | Account::Yggdrasil(account) => account.uuid == uuid,
+            Account::Offline(_) => false,
+        })
+    }
+
+    /// How many real accounts are stored.
+    pub fn signed_in_count(&self) -> usize {
+        self.entries.iter().filter(|account| account.is_online()).count()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -684,7 +857,8 @@ mod tests {
         assert!(!state.can_launch());
         state.busy = false;
 
-        state.accounts.clear();
+        // The offline profile is always present, so a launch is always possible
+        // without signing in; only an empty selection blocks it.
         state.selected_account = None;
         assert!(!state.can_launch());
     }
@@ -995,6 +1169,93 @@ mod tests {
 
         // Other versions keep their own answer.
         assert_eq!(state.java_major_for("1.20.1"), None);
+    }
+
+    #[test]
+    fn the_offline_profile_is_always_the_last_entry() {
+        // PLAY must be usable with no sign-in, so there is never an empty list.
+        let list = AccountList::from_config(&Config::default(), "Player");
+        assert_eq!(list.entries.len(), 1);
+        assert_eq!(list.offline_index(), 0);
+        assert_eq!(list.selected(Some(0)).map(Account::username), Some("Player"));
+        assert!(!list.selected(Some(0)).unwrap().is_online());
+    }
+
+    #[test]
+    fn a_stored_account_is_listed_before_the_offline_profile() {
+        let mut config = Config::default();
+        config.accounts.insert(
+            "uuid-1".to_owned(),
+            mango_core::config::AccountMeta {
+                kind: mango_core::config::AccountKind::Microsoft,
+                uuid: "uuid-1".to_owned(),
+                username: "Steve".to_owned(),
+                expires_at: Some(1_700_000_000),
+                yggdrasil_base: None,
+            },
+        );
+
+        let list = AccountList::from_config(&config, "Player");
+        assert_eq!(list.entries.len(), 2);
+        assert_eq!(list.selected(Some(0)).map(Account::username), Some("Steve"));
+        assert!(list.selected(Some(0)).unwrap().is_online());
+        assert_eq!(list.offline_index(), 1);
+        assert_eq!(list.signed_in_count(), 1);
+        assert_eq!(list.index_of("uuid-1"), Some(0));
+    }
+
+    #[test]
+    fn the_remembered_account_is_preselected() {
+        let mut config = Config::default();
+        for (uuid, name) in [("u1", "Alex"), ("u2", "Steve")] {
+            config.accounts.insert(
+                uuid.to_owned(),
+                mango_core::config::AccountMeta {
+                    kind: mango_core::config::AccountKind::Microsoft,
+                    uuid: uuid.to_owned(),
+                    username: name.to_owned(),
+                    expires_at: None,
+                    yggdrasil_base: None,
+                },
+            );
+        }
+        config.selected_account = Some("u2".to_owned());
+
+        let state = UiState::new(&config);
+        assert_eq!(state.selected_username(), Some("Steve"));
+        assert!(state.selected_signed_in().is_some());
+    }
+
+    #[test]
+    fn with_no_remembered_account_the_offline_profile_is_selected() {
+        let state = UiState::new(&Config::default());
+        assert_eq!(state.selected_username(), Some(default_username().as_str()));
+        assert!(state.selected_signed_in().is_none(), "offline is not a sign-in");
+    }
+
+    #[test]
+    fn removing_the_selected_account_falls_back_to_offline() {
+        let mut config = Config::default();
+        config.accounts.insert(
+            "u1".to_owned(),
+            mango_core::config::AccountMeta {
+                kind: mango_core::config::AccountKind::Microsoft,
+                uuid: "u1".to_owned(),
+                username: "Steve".to_owned(),
+                expires_at: None,
+                yggdrasil_base: None,
+            },
+        );
+        config.selected_account = Some("u1".to_owned());
+
+        let mut state = UiState::new(&config);
+        assert_eq!(state.selected_username(), Some("Steve"));
+
+        // The app reloads after the config loses the account; nothing points at it.
+        let empty = Config::default();
+        state.reload_accounts(&empty, None);
+        assert_eq!(state.selected_username(), Some(default_username().as_str()));
+        assert!(state.selected_signed_in().is_none());
     }
 
     fn sample_update(version: &str) -> mango_core::updater::Update {

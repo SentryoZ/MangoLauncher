@@ -40,6 +40,19 @@ pub async fn sign_in(
     data: &DataPaths,
     config: &mut Config,
 ) -> Result<AccountMeta> {
+    sign_in_with_hint(client, data, config, |_| {}).await
+}
+
+/// Sign in, reporting the browser URL before it is opened.
+///
+/// The UI shows the URL so a player whose browser does not open can paste it, and
+/// so the wait for the redirect is visible rather than looking like a hang.
+pub async fn sign_in_with_hint(
+    client: &reqwest::Client,
+    data: &DataPaths,
+    config: &mut Config,
+    on_url: impl Fn(&str),
+) -> Result<AccountMeta> {
     let client_id = microsoft::configured_client_id(data.root()).ok_or_else(|| {
         MangoError::Other(
             "no Microsoft client ID configured; set MANGO_MSA_CLIENT_ID or create msa.json"
@@ -47,7 +60,7 @@ pub async fn sign_in(
         )
     })?;
 
-    let (tokens, _pkce) = microsoft::interactive_login(&client_id).await?;
+    let (tokens, _pkce) = microsoft::interactive_login(&client_id, on_url).await?;
     let refresh_token = tokens.refresh_token.clone().ok_or_else(|| {
         MangoError::Other(
             "Microsoft did not return a refresh token; is offline_access granted?".to_owned(),

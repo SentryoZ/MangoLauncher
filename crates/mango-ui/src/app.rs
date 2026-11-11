@@ -9,7 +9,7 @@ use mango_core::config::Config;
 use mango_core::paths::DataPaths;
 
 use crate::runtime::{Command, RuntimeHandle, roots_for};
-use crate::state::{UiState, View};
+use crate::state::{Account, UiState, View};
 use crate::theme;
 use crate::views;
 
@@ -34,12 +34,65 @@ pub struct MangoApp {
 }
 
 impl MangoApp {
+    /// Start a Microsoft sign-in. Safe to call with no client ID configured: the
+    /// worker reports that as an actionable message.
+    fn sign_in(&mut self) {
+        self.state.error = None;
+        self.runtime.send(Command::SignIn);
+    }
+
+    /// Remove the selected account and fall back to the offline profile.
+    fn sign_out(&mut self) {
+        let Some(account) = self.state.accounts.selected(self.state.selected_account) else {
+            return;
+        };
+        let (uuid, username) = match account {
+            Account::Microsoft(signed_in) => (signed_in.uuid.clone(), signed_in.username.clone()),
+            Account::Yggdrasil(signed_in) => (signed_in.uuid.clone(), signed_in.username.clone()),
+            Account::Offline(_) => {
+                self.state.error = Some("the offline profile cannot be removed".to_owned());
+                return;
+            }
+        };
+
+        let confirmed = rfd::MessageDialog::new()
+            .set_title("Sign out")
+            .set_description(format!(
+                "Remove {username}? The stored credentials are deleted from the OS keyring."
+            ))
+            .set_buttons(rfd::MessageButtons::YesNo)
+            .show();
+
+        if confirmed == rfd::MessageDialogResult::Yes {
+            self.runtime.send(Command::SignOut { uuid });
+        }
+    }
+
+    fn refresh_account(&mut self) {
+        let Some(account) = self.state.accounts.selected(self.state.selected_account) else {
+            return;
+        };
+        let uuid = match account {
+            Account::Microsoft(signed_in) => signed_in.uuid.clone(),
+            Account::Yggdrasil(signed_in) => signed_in.uuid.clone(),
+            Account::Offline(_) => {
+                self.state.error = Some("the offline profile has no token to refresh".to_owned());
+                return;
+            }
+        };
+
+        self.state.error = None;
+        self.runtime.send(Command::RefreshAccount { uuid });
+    }
+
     pub fn new(cc: &eframe::CreationContext<'_>, env: AppEnv) -> Self {
         theme::apply(&cc.egui_ctx);
         egui_extras::install_image_loaders(&cc.egui_ctx);
 
         let ctx = cc.egui_ctx.clone();
-        let runtime = RuntimeHandle::spawn(move || ctx.request_repaint());
+        // The worker needs the data directory to persist a sign-in and to read the
+        // client ID, so it keeps its own copy.
+        let runtime = RuntimeHandle::spawn(env.data.clone(), move || ctx.request_repaint());
 
         let state = UiState::new(&env.config);
 
@@ -126,6 +179,7 @@ impl MangoApp {
             server: Box::new(server),
             roots,
             username,
+            account: self.selected_account_uuid(),
             java,
             detached: self.state.settings.launch_detached,
         });
@@ -248,6 +302,7 @@ impl MangoApp {
             instance: Box::new(instance.clone()),
             roots,
             username: self.state.selected_username().unwrap_or("Player").to_owned(),
+            account: self.selected_account_uuid(),
             detached: self.state.settings.launch_detached,
         });
         // Remembered so the presence card can name the instance; it is not in the
@@ -265,6 +320,11 @@ impl MangoApp {
         self.last_pinged = Some(address.clone());
         self.state.pinging = true;
         self.runtime.send(Command::PingServer { address });
+    }
+
+    /// Uuid to launch as, or `None` for the offline profile.
+    fn selected_account_uuid(&self) -> Option<String> {
+        self.state.selected_signed_in().map(|account| account.uuid.clone())
     }
 
     /// Push the current state to Discord.
@@ -415,6 +475,15 @@ impl eframe::App for MangoApp {
             self.state.logs.push(line);
         }
 
+        // A sign-in or removal only changes the config; the list is rebuilt here,
+        // where the config is owned.
+        if let Some(uuid) = self.state.pending_select_account.clone() {
+            self.state.pending_select_account = None;
+            self.env.config = mango_core::config::Config::load(&self.env.data)
+                .unwrap_or_else(|_| self.env.config.clone());
+            self.state.reload_accounts(&self.env.config, Some(&uuid));
+        }
+
         self.maybe_ping();
         self.maybe_update_presence();
 
@@ -484,6 +553,9 @@ impl eframe::App for MangoApp {
             Action::ApplyUpdate => self.apply_update(),
             Action::DismissUpdate => self.state.update_dismissed = true,
             Action::CheckForUpdate => self.check_for_update(),
+            Action::SignIn => self.sign_in(),
+            Action::SignOut => self.sign_out(),
+            Action::RefreshAccount => self.refresh_account(),
         }
     }
 }
@@ -504,4 +576,7 @@ pub enum Action {
     ApplyUpdate,
     DismissUpdate,
     CheckForUpdate,
+    SignIn,
+    SignOut,
+    RefreshAccount,
 }

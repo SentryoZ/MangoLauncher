@@ -5,7 +5,7 @@ use egui::{Align, Layout, RichText};
 
 use crate::app::{Action, AppEnv};
 use crate::runtime::{Command, RuntimeHandle};
-use crate::state::UiState;
+use crate::state::{Account, UiState};
 use crate::theme;
 
 pub fn draw(
@@ -35,6 +35,8 @@ pub fn draw(
     });
 
     egui::ScrollArea::vertical().show(ui, |ui| {
+        section_accounts(ui, state, action);
+        ui.add_space(10.0);
         section_minecraft(ui, state);
         ui.add_space(10.0);
         section_java(ui, state, runtime);
@@ -61,6 +63,95 @@ fn card<R>(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui) -> R)
             add(ui)
         })
         .inner
+}
+
+fn section_accounts(ui: &mut egui::Ui, state: &mut UiState, action: &mut Action) {
+    card(ui, "ACCOUNTS", |ui| {
+        if state.accounts.signed_in_count() == 0 {
+            ui.label(theme::muted(
+                "Sign in with a Microsoft account to join online servers. \
+                 Without one, the launcher uses an offline profile.",
+            ));
+        }
+
+        ui.add_space(6.0);
+        for (index, account) in state.accounts.entries.iter().enumerate() {
+            let selected = state.selected_account == Some(index);
+            ui.horizontal(|ui| {
+                if ui
+                    .selectable_label(selected, RichText::new(account.username()).strong())
+                    .clicked()
+                {
+                    state.selected_account = Some(index);
+                }
+                ui.label(theme::muted(account.kind_label()));
+
+                if let Account::Microsoft(signed_in) | Account::Yggdrasil(signed_in) = account {
+                    // Expiry is worth showing: a stale token is the usual reason a
+                    // launch is refused, and refreshing fixes it.
+                    match signed_in.expires_at {
+                        Some(expires) if expires * 1000 > now_millis() => {
+                            ui.label(theme::muted("token valid"));
+                        }
+                        Some(_) => {
+                            ui.label(RichText::new("token expired").color(theme::DANGER));
+                        }
+                        None => {}
+                    }
+                }
+            });
+        }
+
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            if ui.button("Sign in with Microsoft").clicked() {
+                *action = Action::SignIn;
+            }
+
+            let has_account = state.selected_signed_in().is_some();
+            if ui.add_enabled(has_account, egui::Button::new("Refresh")).clicked() {
+                *action = Action::RefreshAccount;
+            }
+            if ui.add_enabled(has_account, egui::Button::new("Sign out")).clicked() {
+                *action = Action::SignOut;
+            }
+        });
+
+        ui.add_space(4.0);
+        ui.label(theme::muted(
+            "Signing in opens your browser. The launcher never sees your password; \
+             tokens are stored in the OS keyring.",
+        ));
+
+        // A browser that never opened would otherwise look like a hang: the flow is
+        // waiting for a redirect that cannot arrive. The URL is shown so it can be
+        // pasted into a browser by hand.
+        if let Some(url) = state.sign_in_url.clone() {
+            ui.add_space(10.0);
+            ui.label(RichText::new("Waiting for the browser…").color(theme::ACCENT));
+            ui.label(theme::muted(
+                "If no browser opened, copy this address into one. Leave the launcher \
+                 open until it says signed in.",
+            ));
+            ui.add_space(4.0);
+            let mut shown = url.as_str();
+            ui.add(
+                egui::TextEdit::multiline(&mut shown)
+                    .desired_width(ui.available_width())
+                    .desired_rows(3),
+            );
+            if ui.button("Copy address").clicked() {
+                ui.ctx().copy_text(url.clone());
+            }
+        }
+    });
+}
+
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 fn section_minecraft(ui: &mut egui::Ui, state: &mut UiState) {

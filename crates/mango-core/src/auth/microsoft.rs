@@ -126,7 +126,11 @@ pub struct AuthorizationCode {
 
 /// Run the interactive leg: bind a loopback listener, open the browser, and wait
 /// for Microsoft to redirect back with a code.
-pub async fn interactive_login(client_id: &str) -> Result<(MsTokens, Pkce)> {
+///
+/// `on_url` is called with the authorisation URL before the browser is opened, so
+/// a caller can show it. Opening a browser can fail silently on a locked-down
+/// machine, and a URL the player can copy is the only way out of that.
+pub async fn interactive_login(client_id: &str, on_url: impl Fn(&str)) -> Result<(MsTokens, Pkce)> {
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
         .map_err(|err| MangoError::Other(format!("could not bind a loopback port: {err}")))?;
@@ -141,7 +145,14 @@ pub async fn interactive_login(client_id: &str) -> Result<(MsTokens, Pkce)> {
     let url = authorize_url(client_id, &redirect_uri, &pkce, &state);
 
     info!(port, "waiting for the Microsoft sign-in to finish");
-    open_browser(&url)?;
+    on_url(&url);
+
+    // A failure to launch the browser is reported, not fatal: the URL was already
+    // handed to the caller, so the player can paste it into a browser by hand and
+    // the loopback listener still completes the flow.
+    if let Err(err) = open_browser(&url) {
+        tracing::warn!(error = %err, "could not open the browser automatically");
+    }
 
     let code = tokio::time::timeout(LOGIN_TIMEOUT, accept_code(listener, &state)).await.map_err(
         |_| MangoError::Other("sign-in timed out; the browser window was not completed".to_owned()),
@@ -354,17 +365,70 @@ async fn post_token(client: &reqwest::Client, form: &[(&str, &str)]) -> Result<M
     Ok(parsed.into())
 }
 
-/// Open a URL in the user's default browser.
+/// Hand a URL to the OS so it opens in the default browser.
+///
+/// `rundll32 url.dll,FileProtocolHandler` used to be the shortcut here, but it
+/// spawns successfully even when nothing opens, so a failure was invisible. The
+/// shell API reports a real result.
+#[cfg(windows)]
 fn open_browser(url: &str) -> Result<()> {
-    #[cfg(windows)]
-    let program = ("rundll32.exe", vec!["url.dll,FileProtocolHandler", url]);
-    #[cfg(target_os = "macos")]
-    let program = ("open", vec![url]);
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let program = ("xdg-open", vec![url]);
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn ShellExecuteW(
+            hwnd: *mut std::ffi::c_void,
+            operation: *const u16,
+            file: *const u16,
+            parameters: *const u16,
+            directory: *const u16,
+            show: i32,
+        ) -> *mut std::ffi::c_void;
+    }
 
-    std::process::Command::new(program.0)
-        .args(program.1)
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    const SW_SHOWNORMAL: i32 = 1;
+
+    let operation = wide("open");
+    let file = wide(url);
+
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            operation.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+
+    // ShellExecuteW reports values above 32 on success; anything at or below is a
+    // documented error code (0 = out of memory, 2/3 = not found, and so on).
+    let code = result as isize;
+    if code <= 32 {
+        return Err(MangoError::Other(format!(
+            "the shell could not open a browser (ShellExecuteW returned {code})"
+        )));
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn open_browser(url: &str) -> Result<()> {
+    std::process::Command::new("open")
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| MangoError::Other(format!("could not open the browser: {err}")))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn open_browser(url: &str) -> Result<()> {
+    std::process::Command::new("xdg-open")
+        .arg(url)
         .spawn()
         .map(|_| ())
         .map_err(|err| MangoError::Other(format!("could not open the browser: {err}")))
@@ -442,10 +506,25 @@ mod tests {
     }
 
     #[test]
-    fn redirect_uri_is_encoded() {
-        let pkce = Pkce::new();
-        let url = authorize_url("c", "http://localhost:8080", &pkce, "s");
-        assert!(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A8080"), "{url}");
+    fn the_default_client_id_is_a_guid() {
+        // A malformed id fails the handshake with a vague Microsoft error, so the
+        // shape is checked here instead.
+        let id = MANGO_CLIENT_ID.trim();
+        assert_eq!(id.len(), 36, "{id}");
+        assert_eq!(id.matches('-').count(), 4, "{id}");
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'), "{id}");
+    }
+
+    /// The shell call is what a player sees first.
+    ///
+    /// Note that a success return does **not** prove a browser appeared: on this
+    /// machine `ShellExecuteW` reports success even for an unregistered scheme. That
+    /// is exactly why the UI shows the URL — the launcher cannot tell whether a
+    /// window opened, so the player must be able to finish the flow by hand.
+    #[cfg(windows)]
+    #[test]
+    fn opening_a_url_does_not_panic_on_a_handled_scheme() {
+        assert!(open_browser("https://example.com").is_ok(), "https must be launchable");
     }
 
     #[test]

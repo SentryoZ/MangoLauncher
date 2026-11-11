@@ -34,6 +34,8 @@ pub enum Command {
         server: Box<ServerEntry>,
         roots: PlanRoots,
         username: String,
+        /// Uuid of a signed-in account, or `None` for the offline profile.
+        account: Option<String>,
         java: PathBuf,
         detached: bool,
     },
@@ -42,6 +44,8 @@ pub enum Command {
         instance: Box<UserInstance>,
         roots: PlanRoots,
         username: String,
+        /// Uuid of a signed-in account, or `None` for the offline profile.
+        account: Option<String>,
         detached: bool,
     },
     /// Probe every JVM on the machine.
@@ -63,6 +67,12 @@ pub enum Command {
     },
     /// Resolve the Java a Minecraft version needs, from its metadata.
     LoadJavaRequirement { minecraft: String },
+    /// Open the browser and sign in with a Microsoft account.
+    SignIn,
+    /// Remove a stored account and its keyring entry.
+    SignOut { uuid: String },
+    /// Refresh a stored account's token now.
+    RefreshAccount { uuid: String },
 }
 
 /// Events the worker sends back to the UI.
@@ -118,6 +128,23 @@ pub enum Event {
         minecraft: String,
         major: u32,
     },
+    /// A sign-in finished; the caller reloads `config` and rebuilds the list.
+    SignedIn {
+        uuid: String,
+        username: String,
+    },
+    /// The browser URL for a sign-in that is now waiting for the redirect.
+    SignInUrl {
+        url: String,
+    },
+    /// An account was removed from the config and the keyring.
+    Removed {
+        uuid: String,
+    },
+    /// A token refresh finished.
+    Refreshed {
+        username: String,
+    },
 }
 
 /// Handle held by the UI.
@@ -131,7 +158,14 @@ pub struct RuntimeHandle {
 
 impl RuntimeHandle {
     /// Spawn the worker thread and build the UI-side handle.
-    pub fn spawn(repaint: impl Fn() + Send + Sync + 'static) -> Self {
+    ///
+    /// `data` is where the auth layer keeps `config.json` and reads its client ID;
+    /// the worker owns its own copy so a sign-in can persist without touching the
+    /// UI's config.
+    pub fn spawn(
+        data: mango_core::paths::DataPaths,
+        repaint: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
         let (command_tx, command_rx) = unbounded::<Command>();
         let (event_tx, event_rx) = unbounded::<Event>();
         let repaint = Arc::new(repaint);
@@ -161,7 +195,7 @@ impl RuntimeHandle {
                 let sender = EventSender { events: worker_events, repaint: worker_repaint };
                 let mut presence = PresenceHolder::default();
                 for command in command_rx {
-                    runtime.block_on(run_command(command, &sender, &mut presence));
+                    runtime.block_on(run_command(command, &sender, &mut presence, &data));
                 }
             })
             .expect("could not spawn the launcher worker thread");
@@ -286,7 +320,12 @@ impl EventSender {
     }
 }
 
-async fn run_command(command: Command, sender: &EventSender, presence: &mut PresenceHolder) {
+async fn run_command(
+    command: Command,
+    sender: &EventSender,
+    presence: &mut PresenceHolder,
+    data: &mango_core::paths::DataPaths,
+) {
     match command {
         Command::LoadManifest { source, cache_root } => {
             let result = load_manifest(&source, &cache_root).await;
@@ -337,7 +376,7 @@ async fn run_command(command: Command, sender: &EventSender, presence: &mut Pres
                 Err(err) => sender.failed("install", err),
             }
         }
-        Command::Launch { server, roots, username, java, detached } => {
+        Command::Launch { server, roots, username, account, java, detached } => {
             let client = match http::build_client() {
                 Ok(client) => client,
                 Err(err) => return sender.failed("launch", err),
@@ -349,18 +388,24 @@ async fn run_command(command: Command, sender: &EventSender, presence: &mut Pres
             };
             sender.log(format!("launching {} with {}", server.name, java.display()));
 
+            let (profile, agents) =
+                match resolve_account(&client, data, account.as_deref(), username, sender).await {
+                    Ok(resolved) => resolved,
+                    Err(err) => return sender.failed("launch", err),
+                };
+
             let spec = mango_core::launch::LaunchSpec {
                 minecraft_version: server.minecraft.clone(),
                 version_name: server.id.clone(),
                 game_directory: roots.instance_dir.clone(),
                 java_executable: java,
-                account: mango_core::launch::LaunchAccount::offline(&username),
+                account: profile,
                 loader: server.loader.clone(),
                 detached,
                 resolution: Some((1280, 720)),
                 fullscreen: false,
                 jvm_options: Vec::new(),
-                java_agents: Vec::new(),
+                java_agents: agents,
                 auto_connect: server
                     .auto_connect
                     .then(|| server.host_port())
@@ -440,7 +485,7 @@ async fn run_command(command: Command, sender: &EventSender, presence: &mut Pres
                 Err(err) => sender.failed("install", err),
             }
         }
-        Command::LaunchInstance { instance, roots, username, detached } => {
+        Command::LaunchInstance { instance, roots, username, account, detached } => {
             let client = match http::build_client() {
                 Ok(client) => client,
                 Err(err) => return sender.failed("launch", err),
@@ -453,8 +498,16 @@ async fn run_command(command: Command, sender: &EventSender, presence: &mut Pres
             };
             sender.log(format!("launching {} with {}", instance.name, java.display()));
 
+            let (profile, agents) =
+                match resolve_account(&client, data, account.as_deref(), username.clone(), sender)
+                    .await
+                {
+                    Ok(resolved) => resolved,
+                    Err(err) => return sender.failed("launch", err),
+                };
+
             crate::runtime::launch_user_instance(
-                &client, &instance, &roots, &username, java, detached, sender,
+                &client, &instance, &roots, profile, agents, java, detached, sender,
             )
             .await;
         }
@@ -584,6 +637,81 @@ async fn run_command(command: Command, sender: &EventSender, presence: &mut Pres
                 }
             }
         }
+        Command::SignIn => {
+            let client = match http::build_client() {
+                Ok(client) => client,
+                Err(err) => return sender.failed("sign-in", err),
+            };
+
+            // The browser is opened by the auth layer; the worker only reports the
+            // outcome. Config is re-read here so a sign-in started from a stale UI
+            // does not resurrect removed accounts.
+            let mut config = match mango_core::config::Config::load(data) {
+                Ok(config) => config,
+                Err(err) => return sender.failed("sign-in", err),
+            };
+
+            sender.log("opening the browser to sign in…");
+            match mango_core::auth::sign_in_with_hint(&client, data, &mut config, |url| {
+                // Sent before the browser opens, so the URL is visible even when the
+                // launch fails or the player's browser never appears.
+                sender.send(Event::SignInUrl { url: url.to_owned() });
+            })
+            .await
+            {
+                Ok(meta) => {
+                    sender.send(Event::SignedIn {
+                        uuid: meta.uuid.clone(),
+                        username: meta.username.clone(),
+                    });
+                    sender.log(format!("signed in as {}", meta.username));
+                }
+                Err(err) => {
+                    // Sign-in failures are the ones a player can act on (game not
+                    // owned, app not approved, browser closed), so the message is
+                    // shown rather than only logged.
+                    sender.failed("sign-in", mango_core::auth::describe_error(&err));
+                }
+            }
+        }
+        Command::SignOut { uuid } => {
+            let mut config = match mango_core::config::Config::load(data) {
+                Ok(config) => config,
+                Err(err) => return sender.failed("sign-out", err),
+            };
+
+            match mango_core::auth::remove_account(data, &mut config, &uuid) {
+                Ok(()) => {
+                    sender.send(Event::Removed { uuid });
+                    sender.log("account removed");
+                }
+                Err(err) => sender.failed("sign-out", err),
+            }
+        }
+        Command::RefreshAccount { uuid } => {
+            let client = match http::build_client() {
+                Ok(client) => client,
+                Err(err) => return sender.failed("refresh", err),
+            };
+
+            let mut config = match mango_core::config::Config::load(data) {
+                Ok(config) => config,
+                Err(err) => return sender.failed("refresh", err),
+            };
+
+            match mango_core::auth::ensure_fresh(&client, data, &mut config, &uuid).await {
+                Ok(_) => {
+                    let username = config
+                        .accounts
+                        .get(&uuid)
+                        .map(|meta| meta.username.clone())
+                        .unwrap_or_default();
+                    sender.send(Event::Refreshed { username: username.clone() });
+                    sender.log(format!("refreshed the token for {username}"));
+                }
+                Err(err) => sender.failed("refresh", mango_core::auth::describe_error(&err)),
+            }
+        }
     }
 }
 
@@ -650,13 +778,52 @@ async fn read_java(
         .await
 }
 
+/// Build the account a launch runs as, plus any JVM arguments it needs.
+///
+/// A signed-in account gets its real Minecraft token, refreshed if needed. The
+/// offline profile is the fallback, which is what a player with no account, or a
+/// LAN game, uses.
+async fn resolve_account(
+    client: &mango_core::net::http::Client,
+    data: &mango_core::paths::DataPaths,
+    uuid: Option<&str>,
+    username: String,
+    sender: &EventSender,
+) -> Result<(mango_core::launch::LaunchAccount, Vec<String>)> {
+    let Some(uuid) = uuid else {
+        sender.log(format!("launching as the offline profile {username}"));
+        return Ok((mango_core::launch::LaunchAccount::offline(&username), Vec::new()));
+    };
+
+    // Re-read the config: the token may have expired since the UI last looked, and
+    // `launch_profile` refreshes and persists it.
+    let mut config = mango_core::config::Config::load(data)?;
+    match mango_core::auth::launch_profile(client, data, &mut config, uuid).await {
+        Ok((account, agents)) => {
+            let kind = if agents.is_empty() { "online" } else { "online (authlib agent)" };
+            sender.log(format!("launching as {} ({kind})", account.username));
+            Ok((account, agents))
+        }
+        Err(err) => {
+            // Falling back to offline would let the player into single player but
+            // fail the moment they join a server, with a confusing message. Report
+            // it instead.
+            Err(mango_core::MangoError::Other(format!(
+                "could not sign this launch in: {}",
+                mango_core::auth::describe_error(&err)
+            )))
+        }
+    }
+}
+
 /// Spawn a user instance's game process.
 #[allow(clippy::too_many_arguments)]
 async fn launch_user_instance(
     client: &mango_core::net::http::Client,
     instance: &UserInstance,
     roots: &PlanRoots,
-    username: &str,
+    account: mango_core::launch::LaunchAccount,
+    java_agents: Vec<String>,
     java: PathBuf,
     detached: bool,
     sender: &EventSender,
@@ -666,13 +833,13 @@ async fn launch_user_instance(
         version_name: instance.id.clone(),
         game_directory: roots.instance_dir.clone(),
         java_executable: java,
-        account: mango_core::launch::LaunchAccount::offline(username),
+        account,
         loader: instance.loader.clone(),
         detached,
         resolution: Some((1280, 720)),
         fullscreen: false,
         jvm_options: instance.jvm_args.clone(),
-        java_agents: Vec::new(),
+        java_agents,
         auto_connect: None,
     };
 
