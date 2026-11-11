@@ -214,7 +214,7 @@ pub enum ModSource {
     Curseforge,
 }
 
-/// A file hosted by the launcher and placed inside the instance directory.
+/// A file hosted elsewhere and placed inside the instance directory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FileEntry {
@@ -225,9 +225,30 @@ pub struct FileEntry {
     pub size: u64,
     #[serde(default)]
     pub sha256: Option<String>,
+    /// Modrinth publishes SHA-512 and SHA-1 rather than SHA-256, and a modpack
+    /// archive carries exactly those, so all three are accepted.
+    #[serde(default)]
+    pub sha512: Option<String>,
+    #[serde(default)]
+    pub sha1: Option<String>,
     /// Replace an existing file even when the player modified it.
     #[serde(default)]
     pub overwrite: bool,
+}
+
+impl FileEntry {
+    /// The strongest hash this entry carries, for verification.
+    pub fn hash(&self) -> Option<crate::net::downloader::FileHash> {
+        use crate::net::downloader::FileHash;
+
+        if let Some(value) = self.sha512.clone() {
+            return Some(FileHash::sha512(value));
+        }
+        if let Some(value) = self.sha256.clone() {
+            return Some(FileHash::sha256(value));
+        }
+        self.sha1.clone().map(FileHash::sha1)
+    }
 }
 
 fn default_true() -> bool {

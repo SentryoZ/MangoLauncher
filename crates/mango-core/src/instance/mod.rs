@@ -43,15 +43,25 @@ pub enum InstanceOrigin {
     Server { server_id: String },
     /// Created by the player and stored in `instance.json`.
     User,
+    /// Installed from a Modrinth modpack.
+    ///
+    /// The pack owns the version, loader, and file list, exactly like a server
+    /// pack does, so the player cannot edit them without breaking the pack.
+    Modpack { project_id: String, version_id: String },
 }
 
 impl InstanceOrigin {
     /// Whether the player may change the version and loader.
     ///
-    /// A server pack pins these: the server rejects a mismatched client, so
-    /// letting the player edit them would only produce a broken install.
+    /// A server or modpack pins these: a mismatched client is rejected by the
+    /// server, and a modpack's files only load on the version it was built for.
     pub fn is_editable(&self) -> bool {
         matches!(self, InstanceOrigin::User)
+    }
+
+    /// Whether the definition is owned by something other than the player.
+    pub fn is_managed(&self) -> bool {
+        !self.is_editable()
     }
 }
 

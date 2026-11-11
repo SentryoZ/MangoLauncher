@@ -12,5 +12,5 @@ pub use natives::{
 pub use planner::{InstallPlan, NativeArchive, PlanRoots, add_manifest_files, plan_vanilla};
 pub use service::{
     EffectiveVersion, InstallOptions, InstallOutcome, ResolvedVersion, install_instance,
-    install_vanilla, resolve, resolve_effective_version, resolve_version_url,
+    install_modpack, install_vanilla, resolve, resolve_effective_version, resolve_version_url,
 };

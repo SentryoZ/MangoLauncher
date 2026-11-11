@@ -6,5 +6,6 @@
 pub mod instances;
 pub mod landing;
 pub mod logs;
+pub mod modpacks;
 pub mod settings;
 pub mod sidebar;

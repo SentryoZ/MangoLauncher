@@ -7,7 +7,9 @@
 //! records exactly which file was chosen so an install stays reproducible.
 
 pub mod curseforge;
+pub mod modpack;
 pub mod modrinth;
+pub mod modrinth_pack;
 
 use crate::error::{MangoError, Result};
 use crate::manifest::{LoaderKind, ModEntry, ModSource};

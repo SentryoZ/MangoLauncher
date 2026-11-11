@@ -170,7 +170,7 @@ pub fn add_manifest_files(
             path,
             url: entry.url.clone(),
             size: entry.size,
-            hash: entry.sha256.clone().map(FileHash::sha256),
+            hash: entry.hash(),
         });
     }
 }

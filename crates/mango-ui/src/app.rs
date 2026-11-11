@@ -322,6 +322,42 @@ impl MangoApp {
         self.runtime.send(Command::PingServer { address });
     }
 
+    fn close_pack(&mut self) {
+        self.state.packs.open = None;
+        self.state.packs.versions.clear();
+        self.state.packs.selected_version = None;
+    }
+
+    /// Download the chosen pack version and install it.
+    fn install_pack(&mut self) {
+        let Some(project) = self.state.packs.open.clone() else { return };
+        let Some(version) = self.state.packs.chosen_version().cloned() else { return };
+
+        // Refuse early rather than after a download: the instance layer would reject
+        // the same id, and the player would have waited for nothing.
+        let instance_id = self.state.packs.target_id.trim().to_owned();
+        if instance_id.is_empty() {
+            self.state.error = Some("give the instance a name".to_owned());
+            return;
+        }
+        if self.env.game_root.join("instances").join(&instance_id).exists() {
+            self.state.error = Some(format!("an instance called `{instance_id}` already exists"));
+            return;
+        }
+
+        let roots = roots_for(&self.env.game_root, &instance_id);
+        self.state.packs.installing = true;
+        self.state.error = None;
+        self.state.launch_pid = None;
+
+        self.runtime.send(Command::InstallPack {
+            project,
+            version: Box::new(crate::runtime::PackChoice::from_version(&version)),
+            roots,
+            instance_id,
+        });
+    }
+
     /// Uuid to launch as, or `None` for the offline profile.
     fn selected_account_uuid(&self) -> Option<String> {
         self.state.selected_signed_in().map(|account| account.uuid.clone())
@@ -444,6 +480,7 @@ impl MangoApp {
 
             for (view, label) in [
                 (View::Landing, "Play"),
+                (View::Modpacks, "Modpacks"),
                 (View::Instances, "Instances"),
                 (View::Settings, "Settings"),
                 (View::Logs, "Logs"),
@@ -482,6 +519,12 @@ impl eframe::App for MangoApp {
             self.env.config = mango_core::config::Config::load(&self.env.data)
                 .unwrap_or_else(|_| self.env.config.clone());
             self.state.reload_accounts(&self.env.config, Some(&uuid));
+        }
+
+        // An install wrote a new recipe to disk, so the instance list is stale.
+        if self.state.pending_reload_instances {
+            self.state.pending_reload_instances = false;
+            self.state.reload_instances(&self.env.game_root.join("instances"));
         }
 
         self.maybe_ping();
@@ -523,6 +566,13 @@ impl eframe::App for MangoApp {
             .frame(egui::Frame::default().inner_margin(egui::Margin::same(18)))
             .show(ctx, |ui| match self.state.view {
                 View::Landing => views::landing::draw(ui, &mut self.state, &self.env, &mut action),
+                View::Modpacks => views::modpacks::draw(
+                    ui,
+                    &mut self.state,
+                    &self.env,
+                    &self.runtime,
+                    &mut action,
+                ),
                 View::Instances => views::instances::draw(
                     ui,
                     &mut self.state,
@@ -556,6 +606,8 @@ impl eframe::App for MangoApp {
             Action::SignIn => self.sign_in(),
             Action::SignOut => self.sign_out(),
             Action::RefreshAccount => self.refresh_account(),
+            Action::ClosePack => self.close_pack(),
+            Action::InstallPack => self.install_pack(),
         }
     }
 }
@@ -579,4 +631,6 @@ pub enum Action {
     SignIn,
     SignOut,
     RefreshAccount,
+    ClosePack,
+    InstallPack,
 }

@@ -21,6 +21,7 @@ pub enum View {
     #[default]
     Landing,
     Instances,
+    Modpacks,
     Settings,
     Logs,
 }
@@ -78,6 +79,10 @@ pub struct UiState {
     pub pending_select_account: Option<String>,
     /// Authorisation URL for a sign-in that is waiting for the browser redirect.
     pub sign_in_url: Option<String>,
+    /// Modpack browser.
+    pub packs: PackBrowser,
+    /// Set when an install finished, so the app rescans the instances directory.
+    pub pending_reload_instances: bool,
 }
 
 impl UiState {
@@ -230,10 +235,15 @@ impl UiState {
                 self.loading_manifest = false;
                 self.pinging = false;
                 self.progress = None;
-                // A failed sign-in leaves no redirect coming, so the waiting banner
-                // must not stay on screen.
+                // A failed sign-in or install leaves no work in flight, so the
+                // spinner and its banner must not stay on screen.
                 if context == "sign-in" {
                     self.sign_in_url = None;
+                }
+                if context == "modpack" || context == "modpacks" {
+                    self.packs.installing = false;
+                    self.packs.searching = false;
+                    self.packs.loading_versions = false;
                 }
                 self.error = Some(format!("{context}: {message}"));
                 self.logs.push(format!("ERROR ({context}): {message}"));
@@ -297,6 +307,31 @@ impl UiState {
             Event::Refreshed { username, .. } => {
                 self.logs.push(format!("refreshed the token for {username}"));
                 self.error = None;
+            }
+            Event::PacksFound { packs } => {
+                self.packs.searching = false;
+                self.packs.results = packs;
+                self.error = None;
+            }
+            Event::PackVersionsLoaded { project, versions } => {
+                self.packs.loading_versions = false;
+
+                // Ignore a reply for a pack the player already navigated away from.
+                if self.packs.open.as_deref() != Some(project.as_str()) {
+                    return;
+                }
+
+                // Default to what a player would pick, so Install works without
+                // reading the list.
+                let preferred = mango_core::mods::modrinth_pack::preferred_version(&versions, None);
+                self.packs.selected_version = preferred.map(|version| version.id.clone());
+                self.packs.versions = versions;
+            }
+            Event::PackInstalled { instance_id } => {
+                self.packs.installing = false;
+                self.packs.open = None;
+                self.logs.push(format!("installed modpack as {instance_id}"));
+                self.pending_reload_instances = true;
             }
         }
     }
@@ -584,6 +619,55 @@ impl SettingsDraft {
 /// Name used for the default offline profile.
 pub fn default_username() -> String {
     "Player".to_owned()
+}
+
+/// Modpack browser state.
+///
+/// Kept small: the catalogue is remote, so this holds only the search box, the
+/// last results, and which pack is open.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PackBrowser {
+    pub query: String,
+    pub results: Vec<mango_core::mods::modrinth_pack::PackSummary>,
+    pub searching: bool,
+    /// Slug of the pack whose versions are open.
+    pub open: Option<String>,
+    pub versions: Vec<mango_core::mods::modrinth_pack::PackVersion>,
+    pub loading_versions: bool,
+    /// Version chosen in the open pack, ready to install.
+    pub selected_version: Option<String>,
+    /// Instance id an install will use, editable so a second copy of the same pack
+    /// does not overwrite the first.
+    pub target_id: String,
+    pub installing: bool,
+}
+
+impl PackBrowser {
+    /// Version the install button would use.
+    pub fn chosen_version(&self) -> Option<&mango_core::mods::modrinth_pack::PackVersion> {
+        let id = self.selected_version.as_deref()?;
+        self.versions.iter().find(|version| version.id == id)
+    }
+
+    /// Whether Install can be pressed.
+    pub fn can_install(&self) -> bool {
+        !self.installing
+            && self.open.is_some()
+            && self.chosen_version().is_some()
+            && is_safe_instance_id(&self.target_id)
+    }
+}
+
+/// Whether an id can be used as an instance directory name.
+///
+/// Mirrors the rule the instance layer enforces, so the Install button is disabled
+/// before a request is made rather than failing afterwards.
+fn is_safe_instance_id(id: &str) -> bool {
+    let id = id.trim();
+    !id.is_empty()
+        && id.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '-' || character == '_'
+        })
 }
 
 /// A signed-in account, as the UI needs it.

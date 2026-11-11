@@ -73,6 +73,17 @@ pub enum Command {
     SignOut { uuid: String },
     /// Refresh a stored account's token now.
     RefreshAccount { uuid: String },
+    /// Search Modrinth for modpacks.
+    SearchPacks { query: String },
+    /// Fetch the installable versions of one pack.
+    LoadPackVersions { project: String },
+    /// Download and install a pack version.
+    InstallPack {
+        project: String,
+        version: Box<crate::runtime::PackChoice>,
+        roots: PlanRoots,
+        instance_id: String,
+    },
 }
 
 /// Events the worker sends back to the UI.
@@ -145,6 +156,43 @@ pub enum Event {
     Refreshed {
         username: String,
     },
+    /// Modpack search results.
+    PacksFound {
+        packs: Vec<mango_core::mods::modrinth_pack::PackSummary>,
+    },
+    /// Installable versions of one pack, newest first.
+    PackVersionsLoaded {
+        project: String,
+        versions: Vec<mango_core::mods::modrinth_pack::PackVersion>,
+    },
+    /// A modpack finished installing.
+    PackInstalled {
+        instance_id: String,
+    },
+}
+
+/// The pack version to install.
+///
+/// The UI already holds a [`PackVersion`](mango_core::mods::modrinth_pack::PackVersion),
+/// but only these fields are needed to download it, and copying them keeps the
+/// command free of a big payload in debug output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackChoice {
+    pub version_id: String,
+    pub url: String,
+    pub file_name: String,
+    pub size: u64,
+}
+
+impl PackChoice {
+    pub fn from_version(version: &mango_core::mods::modrinth_pack::PackVersion) -> Self {
+        Self {
+            version_id: version.id.clone(),
+            url: version.url.clone(),
+            file_name: version.file_name.clone(),
+            size: version.size,
+        }
+    }
 }
 
 /// Handle held by the UI.
@@ -710,6 +758,93 @@ async fn run_command(
                     sender.log(format!("refreshed the token for {username}"));
                 }
                 Err(err) => sender.failed("refresh", mango_core::auth::describe_error(&err)),
+            }
+        }
+        Command::SearchPacks { query } => {
+            let client = match http::build_client() {
+                Ok(client) => client,
+                Err(err) => return sender.failed("modpacks", err),
+            };
+
+            match mango_core::mods::modrinth_pack::search(
+                &client,
+                &query,
+                None,
+                mango_core::mods::modrinth_pack::SEARCH_LIMIT,
+            )
+            .await
+            {
+                Ok(packs) => {
+                    sender.log(format!("{} packs for `{query}`", packs.len()));
+                    sender.send(Event::PacksFound { packs });
+                }
+                Err(err) => sender.failed("modpacks", err),
+            }
+        }
+        Command::LoadPackVersions { project } => {
+            let client = match http::build_client() {
+                Ok(client) => client,
+                Err(err) => return sender.failed("modpacks", err),
+            };
+
+            match mango_core::mods::modrinth_pack::versions(&client, &project).await {
+                Ok(versions) => {
+                    sender.log(format!("{} versions for {project}", versions.len()));
+                    sender.send(Event::PackVersionsLoaded { project, versions });
+                }
+                Err(err) => sender.failed("modpacks", err),
+            }
+        }
+        Command::InstallPack { project, version, roots, instance_id } => {
+            let client = match http::build_client() {
+                Ok(client) => client,
+                Err(err) => return sender.failed("modpack", err),
+            };
+
+            sender.log(format!("downloading {project} {}", version.version_id));
+
+            let pack_version = mango_core::mods::modrinth_pack::PackVersion {
+                id: version.version_id.clone(),
+                version_number: version.version_id.clone(),
+                game_versions: Vec::new(),
+                loaders: Vec::new(),
+                url: version.url.clone(),
+                file_name: version.file_name.clone(),
+                size: version.size,
+                version_type: "release".to_owned(),
+            };
+
+            let pack = match mango_core::mods::modrinth_pack::download(&client, &pack_version).await
+            {
+                Ok(pack) => pack,
+                Err(err) => return sender.failed("modpack", err),
+            };
+
+            sender.log(format!(
+                "{}: Minecraft {:?}, loader {:?}, {} files",
+                pack.index.name,
+                pack.index.minecraft(),
+                pack.index.loader().kind,
+                pack.index.client_files().len()
+            ));
+
+            let progress = ProgressBridge { sender };
+            match mango_core::install::install_modpack(
+                &client,
+                &pack,
+                &instance_id,
+                &project,
+                &roots,
+                &RuleContext::new(),
+                &|event| progress.on(event),
+            )
+            .await
+            {
+                Ok(spec) => {
+                    sender.send(Event::PackInstalled { instance_id: instance_id.clone() });
+                    sender.log(format!("installed {} as {}", spec.name, instance_id));
+                }
+                Err(err) => sender.failed("modpack", err),
             }
         }
     }

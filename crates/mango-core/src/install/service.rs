@@ -178,6 +178,58 @@ pub async fn install_instance(
     Ok(InstallOutcome { mods, ..outcome })
 }
 
+/// Install a Modrinth modpack into an instance directory.
+///
+/// The pack's index pins every file, so this is an install without resolution:
+/// loader from the index dependencies, files straight from the index, and
+/// `overrides/` extracted directly. Mods are NOT registered in `instance.mods`;
+/// the index already lists them as files, and resolving them again would pick
+/// different versions than the author chose.
+pub async fn install_modpack(
+    client: &Client,
+    pack: &crate::mods::modpack::Modpack,
+    instance_id: &str,
+    project_id: &str,
+    roots: &PlanRoots,
+    ctx: &RuleContext,
+    progress: &impl Fn(Progress),
+) -> Result<crate::instance::InstanceSpec> {
+    let index = &pack.index;
+
+    let minecraft = index.minecraft().ok_or_else(|| {
+        MangoError::Other("the pack does not name a Minecraft version".to_owned())
+    })?;
+
+    let spec = crate::instance::InstanceSpec {
+        id: instance_id.to_owned(),
+        name: index.name.clone(),
+        minecraft: minecraft.to_owned(),
+        loader: index.loader(),
+        jvm_args: Vec::new(),
+        mods: Vec::new(),
+        // The pack's own file list, already hash-pinned.
+        files: index.client_files(),
+        address: None,
+        auto_connect: false,
+        // The index records the pack's own version id, not the Modrinth project it
+        // came from, so both are needed to identify it for an update later.
+        origin: crate::instance::InstanceOrigin::Modpack {
+            project_id: project_id.to_owned(),
+            version_id: index.version_id.clone(),
+        },
+    };
+
+    let options = InstallOptions::default();
+    install_instance(client, &spec, roots, ctx, None, &options, progress).await?;
+
+    // After the downloads: a config the player already tuned must not be replaced,
+    // which is why this only writes files that are missing.
+    let written = pack.extract_overrides(&roots.instance_dir)?;
+    info!(written, instance = instance_id, "modpack overrides extracted");
+
+    Ok(spec)
+}
+
 /// Resolve the enabled mods for an instance.
 async fn resolve_mods(
     client: &Client,
